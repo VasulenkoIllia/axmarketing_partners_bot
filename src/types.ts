@@ -18,8 +18,10 @@ export interface BroadcastResult {
 }
 
 export interface ScheduledBroadcast {
+  adminChatId: number;
   pending: PendingBroadcast;
   scheduledFor: Date;
+  label: string; // human-readable time label, e.g. "18:30 (сьогодні)"
   statusMessageId: number; // so we can edit/delete it when it fires
   timerHandle: ReturnType<typeof setTimeout>;
 }

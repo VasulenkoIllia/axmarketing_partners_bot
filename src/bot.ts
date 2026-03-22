@@ -43,8 +43,8 @@ const waitingForCustomTime = new Set<number>();
 /** Active broadcast session (pending content + subset selection). */
 const broadcastSessions = new Map<number, BroadcastSession>();
 
-/** Pending scheduled broadcasts. Cleared on bot restart — warn user. */
-const scheduledBroadcasts = new Map<number, ScheduledBroadcast>();
+/** Pending scheduled broadcasts keyed by token. Multiple per admin are allowed. */
+const scheduledBroadcasts = new Map<string, ScheduledBroadcast>();
 
 /** Dead chat IDs found by /checkchats, keyed by admin chatId. */
 const checkchatsDeadIds = new Map<number, number[]>();
@@ -233,12 +233,15 @@ bot.command('start', async (ctx) => {
   // Feature 5: show stats
   const chats = loadChats();
   const lastBroadcast = getLastGlobalBroadcast();
-  const scheduled = scheduledBroadcasts.get(ctx.chat.id);
+
+  const adminScheduled = [...scheduledBroadcasts.values()].filter(
+    (s) => s.adminChatId === ctx.chat.id,
+  );
 
   let statsLine = `\n📊 Підключено чатів: <b>${chats.length}</b>`;
   statsLine += `\n📅 Остання розсилка: <b>${lastBroadcast ? timeAgo(lastBroadcast) : 'ніколи'}</b>`;
-  if (scheduled) {
-    statsLine += `\n⏰ Запланована розсилка: <b>${formatTime(scheduled.scheduledFor)}</b>`;
+  if (adminScheduled.length > 0) {
+    statsLine += `\n⏰ Запланованих розсилок: <b>${adminScheduled.length}</b> — /scheduled`;
   }
 
   await ctx.reply(
@@ -246,6 +249,7 @@ bot.command('start', async (ctx) => {
       statsLine +
       '\n\n<b>Команди:</b>\n' +
       '/broadcast — розіслати повідомлення\n' +
+      '/scheduled — заплановані розсилки\n' +
       '/addlink — посилання для додавання бота в чат\n' +
       '/addchat — повернути видалений чат до списку\n' +
       '/checkchats — перевірити статус чатів\n' +
@@ -269,12 +273,13 @@ bot.command('help', async (ctx) => {
       '<b>Підтримувані типи:</b>\n' +
       'Текст, фото, відео, документ, аудіо, голосове, кружок (video note)\n\n' +
       '<b>Команди:</b>\n' +
+      '/broadcast — запустити розсилку\n' +
+      '/scheduled — переглянути та скасувати заплановані розсилки\n' +
       '/addlink — посилання для швидкого додавання бота\n' +
       '/addchat — повернути видалений чат або додати вручну\n' +
       '/list — всі підключені чати\n' +
       '/checkchats — статус бота в кожному чаті\n' +
       '/removechat — видалити чат\n' +
-      '/broadcast — запустити розсилку\n' +
       '/cancel — скасувати\n\n' +
       '⚠️ Заплановані розсилки скасовуються при перезапуску бота.',
     { parse_mode: 'HTML' },
@@ -359,8 +364,6 @@ bot.command('checkchats', async (ctx) => {
 
   await sendLong(ctx.chat.id, text, { parse_mode: 'HTML', reply_markup: keyboard });
 });
-
-// ─── /removechat ──────────────────────────────────────────────────────────────
 
 // ─── /addchat ─────────────────────────────────────────────────────────────────
 
@@ -476,6 +479,7 @@ bot.command('broadcast', async (ctx) => {
   }
 
   waitingForContent.add(ctx.chat.id);
+  waitingForCustomTime.delete(ctx.chat.id);
   broadcastSessions.delete(ctx.chat.id);
 
   await ctx.reply(
@@ -494,28 +498,55 @@ bot.command('cancel', async (ctx) => {
 
   const hadContent = waitingForContent.has(chatId);
   const hadSession = broadcastSessions.has(chatId);
-  const scheduled = scheduledBroadcasts.get(chatId);
 
   waitingForContent.delete(chatId);
   waitingForCustomTime.delete(chatId);
   broadcastSessions.delete(chatId);
 
-  if (scheduled) {
-    clearTimeout(scheduled.timerHandle);
-    scheduledBroadcasts.delete(chatId);
-    // Edit the scheduled status message
-    await bot.api
-      .editMessageText(chatId, scheduled.statusMessageId, '❌ Заплановану розсилку скасовано.')
-      .catch(() => {});
-    await ctx.reply('❌ Заплановану розсилку скасовано.');
+  if (hadContent || hadSession) {
+    await ctx.reply('❌ Скасовано.');
     return;
   }
 
-  if (hadContent || hadSession) {
-    await ctx.reply('❌ Скасовано.');
+  const scheduledCount = [...scheduledBroadcasts.values()].filter(
+    (s) => s.adminChatId === chatId,
+  ).length;
+
+  if (scheduledCount > 0) {
+    await ctx.reply(
+      `Немає активної операції.\n\nДля керування запланованими розсилками — /scheduled`,
+    );
   } else {
     await ctx.reply('Немає активної операції.');
   }
+});
+
+// ─── /scheduled ───────────────────────────────────────────────────────────────
+
+bot.command('scheduled', async (ctx) => {
+  if (!isAdmin(ctx.chat.id)) return;
+
+  const entries = [...scheduledBroadcasts.entries()].filter(
+    ([, s]) => s.adminChatId === ctx.chat.id,
+  );
+
+  if (entries.length === 0) {
+    await ctx.reply('Немає запланованих розсилок.');
+    return;
+  }
+
+  const kb = new InlineKeyboard();
+  const lines: string[] = [];
+
+  entries.forEach(([tok, s], i) => {
+    lines.push(`${i + 1}. ⏰ <b>${s.label}</b>`);
+    kb.text(`❌ Скасувати ${s.label}`, `cancel_sched_${tok}`).row();
+  });
+
+  await ctx.reply(
+    `<b>Заплановані розсилки (${entries.length}):</b>\n\n${lines.join('\n')}`,
+    { parse_mode: 'HTML', reply_markup: kb },
+  );
 });
 
 // ─── Broadcast content capture ────────────────────────────────────────────────
@@ -559,22 +590,23 @@ bot.on('message', async (ctx) => {
     const fireLabel = formatTime(fireAt) + (isTomorrow(fireAt) ? ' (завтра)' : ' (сьогодні)');
     const capturedSession = { ...session, selectedChatIds: new Set(session.selectedChatIds) };
     const adminChatId = ctx.chat.id;
+    const schedToken = token();
 
     const timerHandle = setTimeout(async () => {
-      scheduledBroadcasts.delete(adminChatId);
-      const allChats = loadChats();
-      capturedSession.selectedChatIds = new Set(allChats.map((c) => c.id));
+      scheduledBroadcasts.delete(schedToken);
       await executeBroadcast(adminChatId, undefined, capturedSession);
     }, delayMs);
 
     const statusMsg = await ctx.reply(
-      `⏰ Заплановано на <b>${fireLabel}</b>.\n/cancel — скасувати`,
+      `⏰ Заплановано на <b>${fireLabel}</b>.\n/scheduled — керувати розсилками`,
       { parse_mode: 'HTML' },
     );
 
-    scheduledBroadcasts.set(adminChatId, {
+    scheduledBroadcasts.set(schedToken, {
+      adminChatId,
       pending: session.pending,
       scheduledFor: fireAt,
+      label: fireLabel,
       statusMessageId: statusMsg.message_id,
       timerHandle,
     });
@@ -584,14 +616,26 @@ bot.on('message', async (ctx) => {
   // ── Forward from group/channel → offer to add to broadcast list ──────────────
   if (!waitingForContent.has(ctx.chat.id)) {
     const origin = ctx.message.forward_origin;
-    if (origin && (origin.type === 'channel' || origin.type === 'chat')) {
-      const sourceId =
-        origin.type === 'channel' ? origin.chat.id : origin.sender_chat.id;
-      const sourceTitle =
-        origin.type === 'channel'
-          ? origin.chat.title
-          : (('title' in origin.sender_chat ? origin.sender_chat.title : undefined) ?? String(origin.sender_chat.id));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const forwardFromChat = (ctx.message as any).forward_from_chat as { id?: number; title?: string } | undefined;
 
+    let sourceId: number | undefined;
+    let sourceTitle: string | undefined;
+
+    if (origin?.type === 'channel') {
+      sourceId = origin.chat.id;
+      sourceTitle = origin.chat.title;
+    } else if (origin?.type === 'chat') {
+      sourceId = origin.sender_chat.id;
+      sourceTitle =
+        ('title' in origin.sender_chat ? origin.sender_chat.title : undefined) ??
+        String(origin.sender_chat.id);
+    } else if (forwardFromChat?.id) {
+      sourceId = forwardFromChat.id;
+      sourceTitle = forwardFromChat.title ?? String(forwardFromChat.id);
+    }
+
+    if (sourceId !== undefined) {
       if (sourceId === config.adminChatId) return;
 
       const alreadyAdded = loadChats().some((c) => c.id === sourceId);
@@ -723,6 +767,40 @@ bot.on('callback_query:data', async (ctx) => {
     return;
   }
 
+  // ── Cancel a specific scheduled broadcast ────────────────────────────────────
+  if (data.startsWith('cancel_sched_')) {
+    const schedToken = data.slice('cancel_sched_'.length);
+    const sched = scheduledBroadcasts.get(schedToken);
+    if (sched) {
+      clearTimeout(sched.timerHandle);
+      scheduledBroadcasts.delete(schedToken);
+      await bot.api
+        .editMessageText(chatId, sched.statusMessageId, `❌ Розсилку ${sched.label} скасовано.`)
+        .catch(() => {});
+    }
+
+    // Refresh the /scheduled list in-place
+    const remaining = [...scheduledBroadcasts.entries()].filter(
+      ([, s]) => s.adminChatId === chatId,
+    );
+    if (remaining.length === 0) {
+      await ctx.editMessageText('✅ Скасовано. Немає більше запланованих розсилок.');
+    } else {
+      const kb = new InlineKeyboard();
+      const lines: string[] = [];
+      remaining.forEach(([tok, s], i) => {
+        lines.push(`${i + 1}. ⏰ <b>${s.label}</b>`);
+        kb.text(`❌ Скасувати ${s.label}`, `cancel_sched_${tok}`).row();
+      });
+      await ctx.editMessageText(
+        `<b>Заплановані розсилки (${remaining.length}):</b>\n\n${lines.join('\n')}`,
+        { parse_mode: 'HTML', reply_markup: kb },
+      );
+    }
+    await ctx.answerCallbackQuery('✅ Скасовано');
+    return;
+  }
+
   // ── Cancel broadcast ──────────────────────────────────────────────────────────
   if (data === 'cancel_broadcast') {
     broadcastSessions.delete(chatId);
@@ -840,29 +918,28 @@ bot.on('callback_query:data', async (ctx) => {
     const capturedSession = { ...session, selectedChatIds: new Set(session.selectedChatIds) };
     broadcastSessions.delete(chatId);
 
-    const fireLabel = formatTime(fireAt);
+    const fireLabel = formatTime(fireAt) + (isTomorrow(fireAt) ? ' (завтра)' : ' (сьогодні)');
+    const schedToken = token();
 
     const timerHandle = setTimeout(async () => {
-      scheduledBroadcasts.delete(chatId);
-      // Delete the "Scheduled for..." status message
+      scheduledBroadcasts.delete(schedToken);
       if (msgId) {
         await bot.api.deleteMessage(chatId, msgId).catch(() => {});
       }
-      // Re-load chats at fire time (additions/removals since scheduling are reflected)
-      const allChats = loadChats();
-      capturedSession.selectedChatIds = new Set(allChats.map((c) => c.id));
       await executeBroadcast(chatId, undefined, capturedSession);
     }, delayMs);
 
-    scheduledBroadcasts.set(chatId, {
+    scheduledBroadcasts.set(schedToken, {
+      adminChatId: chatId,
       pending: session.pending,
       scheduledFor: fireAt,
+      label: fireLabel,
       statusMessageId: msgId ?? 0,
       timerHandle,
     });
 
     await ctx.editMessageText(
-      `⏰ Заплановано на <b>${fireLabel}</b>.\n\n/cancel — скасувати`,
+      `⏰ Заплановано на <b>${fireLabel}</b>.\n\n/scheduled — керувати розсилками`,
       { parse_mode: 'HTML' },
     );
     await ctx.answerCallbackQuery(`Заплановано на ${fireLabel}`);

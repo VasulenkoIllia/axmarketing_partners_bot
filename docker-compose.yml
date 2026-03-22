@@ -7,6 +7,9 @@ services:
     # Read credentials from .env file (never commit .env to git)
     env_file: .env
 
+    environment:
+      - TZ=Europe/Kyiv
+
     volumes:
       # Persist chats.json across container restarts and rebuilds
       - ./data:/app/data
