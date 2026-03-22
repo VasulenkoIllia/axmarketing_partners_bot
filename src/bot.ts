@@ -229,6 +229,7 @@ bot.command('start', async (ctx) => {
       statsLine +
       '\n\n<b>Команди:</b>\n' +
       '/broadcast — розіслати повідомлення\n' +
+      '/addlink — посилання для додавання бота в чат\n' +
       '/checkchats — перевірити статус чатів\n' +
       '/list — список підключених чатів\n' +
       '/removechat — видалити чат\n' +
@@ -250,6 +251,7 @@ bot.command('help', async (ctx) => {
       '<b>Підтримувані типи:</b>\n' +
       'Текст, фото, відео, документ, аудіо, голосове, кружок (video note)\n\n' +
       '<b>Команди:</b>\n' +
+      '/addlink — посилання для швидкого додавання бота\n' +
       '/list — всі підключені чати\n' +
       '/checkchats — статус бота в кожному чаті\n' +
       '/removechat — видалити чат\n' +
@@ -337,6 +339,37 @@ bot.command('checkchats', async (ctx) => {
   }
 
   await sendLong(ctx.chat.id, text, { parse_mode: 'HTML', reply_markup: keyboard });
+});
+
+// ─── /removechat ──────────────────────────────────────────────────────────────
+
+// ─── /addlink ─────────────────────────────────────────────────────────────────
+
+bot.command('addlink', async (ctx) => {
+  if (!isAdmin(ctx.chat.id)) return;
+
+  const username = ctx.me.username;
+
+  // Rights needed to broadcast in groups/supergroups:
+  // manage_chat — marks bot as admin; post_messages — send in restricted groups;
+  // delete_messages + invite_users — common admin utilities
+  const groupRights = 'manage_chat+post_messages+delete_messages+invite_users';
+  const groupLink = `https://t.me/${username}?startgroup=true&admin=${groupRights}`;
+
+  // For channels the key right is post_messages (send messages as channel admin)
+  const channelLink = `https://t.me/${username}?startchannel=true&admin=post_messages`;
+
+  await ctx.reply(
+    '<b>Додати бота в чат:</b>\n\n' +
+      '👥 <b>Група або супергрупа</b>\n' +
+      `<a href="${groupLink}">Натисни → вибери групу → підтверди права</a>\n\n` +
+      '📢 <b>Канал</b>\n' +
+      `<a href="${channelLink}">Натисни → вибери канал → підтверди права</a>\n\n` +
+      '<i>Telegram автоматично запропонує зробити бота адміністратором ' +
+      'з мінімально потрібними правами. Після підтвердження бот ' +
+      'збережеться в списку і надішле сповіщення сюди.</i>',
+    { parse_mode: 'HTML', link_preview_options: { is_disabled: true } },
+  );
 });
 
 // ─── /removechat ──────────────────────────────────────────────────────────────
