@@ -3,6 +3,7 @@ export interface ChatRecord {
   title: string;
   addedAt: string;
   lastBroadcast?: string; // ISO timestamp of last successful copyMessage
+  removedAt?: string;     // set when removed — kept for restore; absent = active
 }
 
 export interface PendingBroadcast {

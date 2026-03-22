@@ -1,6 +1,6 @@
 import { Bot, InlineKeyboard } from 'grammy';
 import { config } from './config';
-import { addChat, removeChat, removeChats, loadChats, getLastGlobalBroadcast } from './storage';
+import { addChat, removeChat, removeChats, restoreChat, loadChats, loadRemovedChats, getLastGlobalBroadcast } from './storage';
 import { broadcast } from './broadcaster';
 import { BroadcastSession, ChatRecord, ScheduledBroadcast } from './types';
 import { timeAgo, formatTime, nextOccurrenceOf, isTomorrow, token } from './utils';
@@ -252,6 +252,7 @@ bot.command('start', async (ctx) => {
       '/scheduled — заплановані розсилки\n' +
       '/addlink — посилання для додавання бота в чат\n' +
       '/addchat — додати чат за ID або постом групи/каналу\n' +
+      '/removedchats — відновити видалені чати\n' +
       '/checkchats — перевірити статус чатів\n' +
       '/list — список підключених чатів\n' +
       '/removechat — видалити чат\n' +
@@ -277,6 +278,7 @@ bot.command('help', async (ctx) => {
       '/scheduled — переглянути та скасувати заплановані розсилки\n' +
       '/addlink — посилання для швидкого додавання бота\n' +
       '/addchat [ID] — додати чат вручну або переслати пост від імені групи/каналу\n' +
+      '/removedchats — переглянути та відновити видалені чати\n' +
       '/list — всі підключені чати\n' +
       '/checkchats — статус бота в кожному чаті\n' +
       '/removechat — видалити чат\n' +
@@ -551,6 +553,33 @@ bot.command('scheduled', async (ctx) => {
   );
 });
 
+// ─── /removedchats ────────────────────────────────────────────────────────────
+
+bot.command('removedchats', async (ctx) => {
+  if (!isAdmin(ctx.chat.id)) return;
+
+  const removed = loadRemovedChats();
+  if (removed.length === 0) {
+    await ctx.reply('Немає видалених чатів.');
+    return;
+  }
+
+  const kb = new InlineKeyboard();
+  const lines: string[] = [];
+
+  removed.forEach((chat, i) => {
+    const when = chat.removedAt ? timeAgo(chat.removedAt) : '—';
+    lines.push(`${i + 1}. <b>${chat.title}</b> <i>(видалено ${when})</i>`);
+    kb.text(`🔄 ${chat.title.length > 24 ? chat.title.slice(0, 23) + '…' : chat.title}`, `restore_${chat.id}`).row();
+  });
+
+  await ctx.reply(
+    `<b>Видалені чати (${removed.length}):</b>\n\n${lines.join('\n')}\n\n` +
+    `Натисніть кнопку щоб повернути чат до списку розсилки.`,
+    { parse_mode: 'HTML', reply_markup: kb },
+  );
+});
+
 // ─── Broadcast content capture ────────────────────────────────────────────────
 
 bot.on('message', async (ctx) => {
@@ -743,6 +772,37 @@ bot.on('callback_query:data', async (ctx) => {
     await ctx.editMessageReplyMarkup({ reply_markup: undefined });
     await ctx.answerCallbackQuery();
     await addChatById(chatId, targetId);
+    return;
+  }
+
+  // ── Restore removed chat ─────────────────────────────────────────────────────
+  if (data.startsWith('restore_')) {
+    const targetId = Number(data.slice('restore_'.length));
+    const ok = restoreChat(targetId);
+    if (!ok) {
+      await ctx.answerCallbackQuery('Чат не знайдено або вже активний.');
+      return;
+    }
+
+    // Refresh the list in-place
+    const remaining = loadRemovedChats();
+    if (remaining.length === 0) {
+      await ctx.editMessageText('✅ Чат повернено до розсилки. Видалених чатів більше немає.');
+    } else {
+      const kb = new InlineKeyboard();
+      const lines: string[] = [];
+      remaining.forEach((chat, i) => {
+        const when = chat.removedAt ? timeAgo(chat.removedAt) : '—';
+        lines.push(`${i + 1}. <b>${chat.title}</b> <i>(видалено ${when})</i>`);
+        kb.text(`🔄 ${chat.title.length > 24 ? chat.title.slice(0, 23) + '…' : chat.title}`, `restore_${chat.id}`).row();
+      });
+      await ctx.editMessageText(
+        `<b>Видалені чати (${remaining.length}):</b>\n\n${lines.join('\n')}\n\n` +
+        `Натисніть кнопку щоб повернути чат до списку розсилки.`,
+        { parse_mode: 'HTML', reply_markup: kb },
+      );
+    }
+    await ctx.answerCallbackQuery('✅ Повернено до розсилки');
     return;
   }
 
