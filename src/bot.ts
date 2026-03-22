@@ -3,7 +3,7 @@ import { config } from './config';
 import { addChat, removeChat, removeChats, loadChats, getLastGlobalBroadcast } from './storage';
 import { broadcast } from './broadcaster';
 import { BroadcastSession, ChatRecord, ScheduledBroadcast } from './types';
-import { timeAgo, formatTime, nextTomorrow0900, token } from './utils';
+import { timeAgo, formatTime, nextOccurrenceOf, isTomorrow, token } from './utils';
 
 export const bot = new Bot(config.botToken);
 
@@ -36,6 +36,9 @@ async function sendLong(
 
 /** Admin is currently expected to send broadcast content. */
 const waitingForContent = new Set<number>();
+
+/** Admin typed "Свій час" and we expect a HH:MM reply next. */
+const waitingForCustomTime = new Set<number>();
 
 /** Active broadcast session (pending content + subset selection). */
 const broadcastSessions = new Map<number, BroadcastSession>();
@@ -103,7 +106,7 @@ function buildConfirmKeyboard(count: number): InlineKeyboard {
     .text('⏰ 30 хв', 'sched_30')
     .text('⏰ 1 год', 'sched_60')
     .text('⏰ 2 год', 'sched_120')
-    .text('⏰ Завтра 9:00', 'sched_tom0900')
+    .text('🕐 Свій час', 'sched_custom')
     .row()
     .text('❌ Скасувати', 'cancel_broadcast');
 }
@@ -116,7 +119,7 @@ function buildSubsetConfirmKeyboard(count: number): InlineKeyboard {
     .text('⏰ 30 хв', 'sched_30')
     .text('⏰ 1 год', 'sched_60')
     .text('⏰ 2 год', 'sched_120')
-    .text('⏰ Завтра 9:00', 'sched_tom0900')
+    .text('🕐 Свій час', 'sched_custom')
     .row()
     .text('❌ Скасувати', 'cancel_broadcast');
 }
@@ -432,6 +435,7 @@ bot.command('cancel', async (ctx) => {
   const scheduled = scheduledBroadcasts.get(chatId);
 
   waitingForContent.delete(chatId);
+  waitingForCustomTime.delete(chatId);
   broadcastSessions.delete(chatId);
 
   if (scheduled) {
@@ -457,6 +461,64 @@ bot.command('cancel', async (ctx) => {
 bot.on('message', async (ctx) => {
   if (!isAdmin(ctx.chat.id)) return;
   if ('text' in ctx.message && ctx.message.text?.startsWith('/')) return;
+
+  // ── Custom time input ────────────────────────────────────────────────────────
+  if (waitingForCustomTime.has(ctx.chat.id)) {
+    const text = ('text' in ctx.message ? ctx.message.text?.trim() : '') ?? '';
+    const match = text.match(/^(\d{1,2}):(\d{2})$/);
+
+    if (!match) {
+      await ctx.reply('Невірний формат. Введіть час як <b>ГГ:ХХ</b>, наприклад: <code>18:30</code>', {
+        parse_mode: 'HTML',
+      });
+      return; // stay in waitingForCustomTime
+    }
+
+    const hour = parseInt(match[1], 10);
+    const minute = parseInt(match[2], 10);
+
+    if (hour > 23 || minute > 59) {
+      await ctx.reply('Невірний час. Година: 0–23, хвилини: 0–59');
+      return;
+    }
+
+    const session = broadcastSessions.get(ctx.chat.id);
+    if (!session) {
+      waitingForCustomTime.delete(ctx.chat.id);
+      await ctx.reply('Сесія закінчилась. Почніть /broadcast заново.');
+      return;
+    }
+
+    waitingForCustomTime.delete(ctx.chat.id);
+    broadcastSessions.delete(ctx.chat.id);
+
+    const fireAt = nextOccurrenceOf(hour, minute);
+    const delayMs = fireAt.getTime() - Date.now();
+    const fireLabel = formatTime(fireAt) + (isTomorrow(fireAt) ? ' (завтра)' : ' (сьогодні)');
+    const capturedSession = { ...session, selectedChatIds: new Set(session.selectedChatIds) };
+    const adminChatId = ctx.chat.id;
+
+    const timerHandle = setTimeout(async () => {
+      scheduledBroadcasts.delete(adminChatId);
+      const allChats = loadChats();
+      capturedSession.selectedChatIds = new Set(allChats.map((c) => c.id));
+      await executeBroadcast(adminChatId, undefined, capturedSession);
+    }, delayMs);
+
+    const statusMsg = await ctx.reply(
+      `⏰ Заплановано на <b>${fireLabel}</b>.\n/cancel — скасувати`,
+      { parse_mode: 'HTML' },
+    );
+
+    scheduledBroadcasts.set(adminChatId, {
+      pending: session.pending,
+      scheduledFor: fireAt,
+      statusMessageId: statusMsg.message_id,
+      timerHandle,
+    });
+    return;
+  }
+
   if (!waitingForContent.has(ctx.chat.id)) return;
 
   waitingForContent.delete(ctx.chat.id);
@@ -647,21 +709,25 @@ bot.on('callback_query:data', async (ctx) => {
     return;
   }
 
-  // ── Scheduled broadcast ───────────────────────────────────────────────────────
+  // ── Custom time: prompt for HH:MM input ──────────────────────────────────────
+  if (data === 'sched_custom') {
+    if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
+    waitingForCustomTime.add(chatId);
+    await ctx.editMessageText(
+      'Введіть час у форматі <b>ГГ:ХХ</b>\nНаприклад: <code>18:30</code>\n\n/cancel — скасувати',
+      { parse_mode: 'HTML' },
+    );
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  // ── Scheduled broadcast (preset delays) ──────────────────────────────────────
   if (data.startsWith('sched_')) {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
 
-    let delayMs: number;
-    let fireAt: Date;
-
-    if (data === 'sched_tom0900') {
-      fireAt = nextTomorrow0900();
-      delayMs = fireAt.getTime() - Date.now();
-    } else {
-      const minutes = parseInt(data.slice('sched_'.length), 10);
-      delayMs = minutes * 60_000;
-      fireAt = new Date(Date.now() + delayMs);
-    }
+    const minutes = parseInt(data.slice('sched_'.length), 10);
+    const delayMs = minutes * 60_000;
+    const fireAt = new Date(Date.now() + delayMs);
 
     const capturedSession = { ...session, selectedChatIds: new Set(session.selectedChatIds) };
     broadcastSessions.delete(chatId);

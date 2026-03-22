@@ -17,13 +17,22 @@ export function formatTime(date: Date): string {
   return date.toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' });
 }
 
-/** Returns next occurrence of 09:00 (today if before 9am, otherwise tomorrow) */
-export function nextTomorrow0900(): Date {
+/**
+ * Returns the next occurrence of HH:MM.
+ * If that time has already passed today, returns tomorrow at that time.
+ */
+export function nextOccurrenceOf(hour: number, minute: number): Date {
   const d = new Date();
   d.setSeconds(0, 0);
-  d.setHours(9, 0);
+  d.setHours(hour, minute);
   if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
   return d;
+}
+
+export function isTomorrow(date: Date): boolean {
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  return date.getDate() === tomorrow.getDate();
 }
 
 export function token(): string {
