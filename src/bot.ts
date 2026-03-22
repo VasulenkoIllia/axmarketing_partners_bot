@@ -247,6 +247,7 @@ bot.command('start', async (ctx) => {
       '\n\n<b>Команди:</b>\n' +
       '/broadcast — розіслати повідомлення\n' +
       '/addlink — посилання для додавання бота в чат\n' +
+      '/addchat — повернути видалений чат до списку\n' +
       '/checkchats — перевірити статус чатів\n' +
       '/list — список підключених чатів\n' +
       '/removechat — видалити чат\n' +
@@ -269,6 +270,7 @@ bot.command('help', async (ctx) => {
       'Текст, фото, відео, документ, аудіо, голосове, кружок (video note)\n\n' +
       '<b>Команди:</b>\n' +
       '/addlink — посилання для швидкого додавання бота\n' +
+      '/addchat — повернути видалений чат або додати вручну\n' +
       '/list — всі підключені чати\n' +
       '/checkchats — статус бота в кожному чаті\n' +
       '/removechat — видалити чат\n' +
@@ -359,6 +361,66 @@ bot.command('checkchats', async (ctx) => {
 });
 
 // ─── /removechat ──────────────────────────────────────────────────────────────
+
+// ─── /addchat ─────────────────────────────────────────────────────────────────
+
+bot.command('addchat', async (ctx) => {
+  if (!isAdmin(ctx.chat.id)) return;
+
+  const args = ctx.message?.text?.split(' ');
+  const targetId = args?.[1] ? Number(args[1]) : null;
+
+  if (!targetId || isNaN(targetId)) {
+    await ctx.reply(
+      'Використання: <code>/addchat -1001234567890</code>\n\n' +
+        'Або просто перешліть будь-яке повідомлення з потрібного чату — ' +
+        'бот сам запропонує його додати.',
+      { parse_mode: 'HTML' },
+    );
+    return;
+  }
+
+  await addChatById(ctx.chat.id, targetId);
+});
+
+/** Verifies bot is in the chat and adds it to the broadcast list. */
+async function addChatById(adminChatId: number, targetChatId: number): Promise<void> {
+  const existing = loadChats().find((c) => c.id === targetChatId);
+  if (existing) {
+    await bot.api.sendMessage(
+      adminChatId,
+      `ℹ️ Чат <b>${existing.title}</b> вже є в списку.`,
+      { parse_mode: 'HTML' },
+    );
+    return;
+  }
+
+  try {
+    const botId = (await bot.api.getMe()).id;
+    const [chatInfo, memberInfo] = await Promise.all([
+      bot.api.getChat(targetChatId),
+      bot.api.getChatMember(targetChatId, botId),
+    ]);
+
+    if (memberInfo.status === 'left' || memberInfo.status === 'kicked') {
+      await bot.api.sendMessage(
+        adminChatId,
+        '❌ Бот не є учасником цього чату. Спочатку додайте його через /addlink',
+      );
+      return;
+    }
+
+    const title = ('title' in chatInfo ? chatInfo.title : undefined) ?? String(targetChatId);
+    addChat({ id: targetChatId, title, addedAt: new Date().toISOString() });
+    await bot.api.sendMessage(
+      adminChatId,
+      `✅ Чат <b>${title}</b> додано до списку розсилки.`,
+      { parse_mode: 'HTML' },
+    );
+  } catch {
+    await bot.api.sendMessage(adminChatId, '❌ Не вдалося знайти чат. Перевірте правильність ID.');
+  }
+}
 
 // ─── /addlink ─────────────────────────────────────────────────────────────────
 
@@ -519,7 +581,38 @@ bot.on('message', async (ctx) => {
     return;
   }
 
-  if (!waitingForContent.has(ctx.chat.id)) return;
+  // ── Forward from group/channel → offer to add to broadcast list ──────────────
+  if (!waitingForContent.has(ctx.chat.id)) {
+    const origin = ctx.message.forward_origin;
+    if (origin && (origin.type === 'channel' || origin.type === 'chat')) {
+      const sourceId =
+        origin.type === 'channel' ? origin.chat.id : origin.sender_chat.id;
+      const sourceTitle =
+        origin.type === 'channel'
+          ? origin.chat.title
+          : (('title' in origin.sender_chat ? origin.sender_chat.title : undefined) ?? String(origin.sender_chat.id));
+
+      if (sourceId === config.adminChatId) return;
+
+      const alreadyAdded = loadChats().some((c) => c.id === sourceId);
+      if (alreadyAdded) {
+        await ctx.reply(`ℹ️ Чат <b>${sourceTitle}</b> вже є в списку розсилки.`, {
+          parse_mode: 'HTML',
+        });
+        return;
+      }
+
+      const keyboard = new InlineKeyboard()
+        .text('✅ Додати до розсилки', `addchat_${sourceId}`)
+        .text('❌ Ні', 'cancel_add');
+
+      await ctx.reply(
+        `Додати <b>${sourceTitle}</b> до списку розсилки?`,
+        { parse_mode: 'HTML', reply_markup: keyboard },
+      );
+    }
+    return;
+  }
 
   waitingForContent.delete(ctx.chat.id);
   const chats = loadChats();
@@ -589,6 +682,21 @@ bot.on('callback_query:data', async (ctx) => {
     const { text, keyboard } = buildRemoveKeyboard(chats, page);
     await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
     await ctx.answerCallbackQuery('✅ Видалено');
+    return;
+  }
+
+  // ── Add chat via forward or /addchat ─────────────────────────────────────────
+  if (data === 'cancel_add') {
+    await ctx.editMessageText('Скасовано.');
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (data.startsWith('addchat_')) {
+    const targetId = Number(data.slice('addchat_'.length));
+    await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+    await ctx.answerCallbackQuery();
+    await addChatById(chatId, targetId);
     return;
   }
 
