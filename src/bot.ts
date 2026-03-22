@@ -94,10 +94,24 @@ function buildRemoveKeyboard(
   return { text, keyboard: kb };
 }
 
+/** Shown after content is sent — before audience is chosen. */
 function buildConfirmKeyboard(count: number): InlineKeyboard {
   return new InlineKeyboard()
     .text(`✅ Всім (${count})`, 'broadcast_all')
     .text('🎯 Вибрати чати', 'broadcast_select')
+    .row()
+    .text('⏰ 30 хв', 'sched_30')
+    .text('⏰ 1 год', 'sched_60')
+    .text('⏰ 2 год', 'sched_120')
+    .text('⏰ Завтра 9:00', 'sched_tom0900')
+    .row()
+    .text('❌ Скасувати', 'cancel_broadcast');
+}
+
+/** Shown after subset is confirmed — uses broadcast_selected to preserve the selection. */
+function buildSubsetConfirmKeyboard(count: number): InlineKeyboard {
+  return new InlineKeyboard()
+    .text(`✅ Надіслати вибраним (${count})`, 'broadcast_selected')
     .row()
     .text('⏰ 30 хв', 'sched_30')
     .text('⏰ 1 год', 'sched_60')
@@ -604,22 +618,32 @@ bot.on('callback_query:data', async (ctx) => {
     const count = session.selectedChatIds.size;
     await ctx.editMessageText(
       `Надіслати в <b>${count}</b> вибраних чат(ів)?`,
-      { parse_mode: 'HTML', reply_markup: buildConfirmKeyboard(count) },
+      { parse_mode: 'HTML', reply_markup: buildSubsetConfirmKeyboard(count) },
     );
     await ctx.answerCallbackQuery();
     return;
   }
 
-  // ── Immediate broadcast (all or selected) ────────────────────────────────────
+  // ── Immediate broadcast — all chats ──────────────────────────────────────────
   if (data === 'broadcast_all') {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
     broadcastSessions.delete(chatId);
-    await ctx.editMessageText(`⏳ Надсилаю в ${loadChats().length} чат(ів)...`);
-    await ctx.answerCallbackQuery('Починаю розсилку...');
-    // Use all chats: pass session with all IDs set
     const allChats = loadChats();
     session.selectedChatIds = new Set(allChats.map((c) => c.id));
+    await ctx.editMessageText(`⏳ Надсилаю в ${allChats.length} чат(ів)...`);
+    await ctx.answerCallbackQuery('Починаю розсилку...');
     await executeBroadcast(chatId, msgId, session);
+    return;
+  }
+
+  // ── Immediate broadcast — selected chats only ─────────────────────────────────
+  if (data === 'broadcast_selected') {
+    if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
+    const count = session.selectedChatIds.size;
+    broadcastSessions.delete(chatId);
+    await ctx.editMessageText(`⏳ Надсилаю в ${count} вибраних чат(ів)...`);
+    await ctx.answerCallbackQuery('Починаю розсилку...');
+    await executeBroadcast(chatId, msgId, session); // selectedChatIds stays as-is
     return;
   }
 
