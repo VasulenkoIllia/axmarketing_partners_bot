@@ -50,6 +50,24 @@ export function removeChats(chatIds: number[]): number {
   return removed;
 }
 
+/**
+ * Handles group→supergroup migration: replaces old chat ID with new one.
+ * Called automatically during broadcast when Telegram returns migrate_to_chat_id.
+ */
+export function migrateChat(oldChatId: number, newChatId: number): void {
+  const chats = loadChats();
+  const chat = chats.find((c) => c.id === oldChatId);
+  if (!chat) return;
+  // Replace old record with new ID, preserve all other fields
+  chat.id = newChatId;
+  // Remove any duplicate entry for the new ID that may already exist
+  const deduped = chats.filter((c) => c.id !== oldChatId || c === chat);
+  const withoutDup = deduped.filter(
+    (c, i, arr) => c.id !== newChatId || arr.indexOf(c) === i,
+  );
+  saveChats(withoutDup);
+}
+
 export function updateLastBroadcast(chatId: number): void {
   const chats = loadChats();
   const chat = chats.find((c) => c.id === chatId);

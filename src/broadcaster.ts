@@ -1,6 +1,6 @@
 import { Bot, GrammyError } from 'grammy';
 import { ChatRecord, BroadcastResult } from './types';
-import { updateLastBroadcast } from './storage';
+import { updateLastBroadcast, migrateChat } from './storage';
 
 const DELAY_MS = 100; // ~10 msg/sec — well within Telegram limits
 
@@ -19,22 +19,41 @@ function isDeadChatError(message: string): boolean {
   );
 }
 
+/**
+ * Attempts copyMessage with automatic handling of:
+ * - 429 Too Many Requests: waits retry_after then retries once
+ * - Group→supergroup migration: updates storage, retries with new ID
+ *
+ * Returns the actual chat ID used (may differ from input on migration).
+ */
 async function tryCopyMessage(
   bot: Bot,
-  chatId: number,
+  chat: ChatRecord,
   sourceChatId: number,
   messageId: number,
-): Promise<void> {
+): Promise<number> {
   try {
-    await bot.api.copyMessage(chatId, sourceChatId, messageId);
+    await bot.api.copyMessage(chat.id, sourceChatId, messageId);
+    return chat.id;
   } catch (err: unknown) {
-    // On 429: wait retry_after seconds and try once more
-    if (err instanceof GrammyError && err.error_code === 429) {
+    if (!(err instanceof GrammyError)) throw err;
+
+    // 429: wait retry_after and retry once
+    if (err.error_code === 429) {
       const retryAfter = ((err.parameters as { retry_after?: number })?.retry_after ?? 5) * 1000;
       await sleep(retryAfter);
-      await bot.api.copyMessage(chatId, sourceChatId, messageId); // let this throw if it fails again
-      return;
+      await bot.api.copyMessage(chat.id, sourceChatId, messageId);
+      return chat.id;
     }
+
+    // Group was upgraded to a supergroup — Telegram provides the new chat ID
+    const newChatId = (err.parameters as { migrate_to_chat_id?: number })?.migrate_to_chat_id;
+    if (newChatId) {
+      migrateChat(chat.id, newChatId); // update storage: old ID → new ID
+      await bot.api.copyMessage(newChatId, sourceChatId, messageId);
+      return newChatId;
+    }
+
     throw err;
   }
 }
@@ -53,8 +72,8 @@ export async function broadcast(
 
   for (const chat of chats) {
     try {
-      await tryCopyMessage(bot, chat.id, sourceChatId, messageId);
-      updateLastBroadcast(chat.id);
+      const usedChatId = await tryCopyMessage(bot, chat, sourceChatId, messageId);
+      updateLastBroadcast(usedChatId);
       result.success++;
     } catch (err: unknown) {
       result.failed++;
