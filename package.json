@@ -1,0 +1,21 @@
+{
+  "name": "axmarketing_partners_bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for broadcasting messages to partner chats",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.0",
+    "grammy": "^1.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.3"
+  },
+  "private": true
+}

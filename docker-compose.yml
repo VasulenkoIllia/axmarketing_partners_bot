@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    container_name: ax_partners_bot
+    restart: unless-stopped
+
+    # Read credentials from .env file (never commit .env to git)
+    env_file: .env
+
+    volumes:
+      # Persist chats.json across container restarts and rebuilds
+      - ./data:/app/data
+
+    # Show structured logs with timestamps
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
