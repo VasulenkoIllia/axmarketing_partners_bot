@@ -64,7 +64,14 @@ const cleanupTokens = new Map<string, number[]>();
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function isAdmin(chatId: number): boolean {
-  return chatId === config.adminChatId;
+  return config.adminChatIds.includes(chatId);
+}
+
+/** Send a message to all admin chats. Errors are swallowed. */
+async function notifyAdmins(text: string, opts: Parameters<typeof bot.api.sendMessage>[2] = {}): Promise<void> {
+  await Promise.all(
+    config.adminChatIds.map((id) => bot.api.sendMessage(id, text, opts).catch(() => {})),
+  );
 }
 
 // ─── /removechat pagination ───────────────────────────────────────────────────
@@ -208,28 +215,21 @@ async function executeBroadcast(
 
 bot.on('my_chat_member', async (ctx) => {
   const chat = ctx.chat;
-  if (chat.id === config.adminChatId || chat.type === 'private') return;
+  if (config.adminChatIds.includes(chat.id) || chat.type === 'private') return;
 
   const newStatus = ctx.myChatMember.new_chat_member.status;
   const chatTitle = (chat as { title?: string }).title ?? String(chat.id);
 
   if (newStatus === 'member' || newStatus === 'administrator') {
     addChat({ id: chat.id, title: chatTitle, addedAt: new Date().toISOString() });
-    await bot.api
-      .sendMessage(
-        config.adminChatId,
-        `✅ Доданий до: <b>${chatTitle}</b>\nID: <code>${chat.id}</code>`,
-        { parse_mode: 'HTML' },
-      )
-      .catch(() => {});
+    await notifyAdmins(
+      `✅ Доданий до: <b>${chatTitle}</b>\nID: <code>${chat.id}</code>`,
+      { parse_mode: 'HTML' },
+    );
   } else if (newStatus === 'left' || newStatus === 'kicked') {
     const removed = removeChat(chat.id);
     if (removed) {
-      await bot.api
-        .sendMessage(config.adminChatId, `❌ Видалений з: <b>${chatTitle}</b>`, {
-          parse_mode: 'HTML',
-        })
-        .catch(() => {});
+      await notifyAdmins(`❌ Видалений з: <b>${chatTitle}</b>`, { parse_mode: 'HTML' });
     }
   }
 });
@@ -243,9 +243,7 @@ bot.command('start', async (ctx) => {
   const chats = loadChats();
   const lastBroadcast = getLastGlobalBroadcast();
 
-  const adminScheduled = [...scheduledBroadcasts.values()].filter(
-    (s) => s.adminChatId === ctx.chat.id,
-  );
+  const adminScheduled = [...scheduledBroadcasts.values()];
 
   let statsLine = `\n📊 Підключено чатів: <b>${chats.length}</b>`;
   statsLine += `\n📅 Остання розсилка: <b>${lastBroadcast ? timeAgo(lastBroadcast) : 'ніколи'}</b>`;
@@ -521,9 +519,7 @@ bot.command('cancel', async (ctx) => {
     return;
   }
 
-  const scheduledCount = [...scheduledBroadcasts.values()].filter(
-    (s) => s.adminChatId === chatId,
-  ).length;
+  const scheduledCount = scheduledBroadcasts.size;
 
   if (scheduledCount > 0) {
     await ctx.reply(
@@ -539,9 +535,7 @@ bot.command('cancel', async (ctx) => {
 bot.command('scheduled', async (ctx) => {
   if (!isAdmin(ctx.chat.id)) return;
 
-  const entries = [...scheduledBroadcasts.entries()].filter(
-    ([, s]) => s.adminChatId === ctx.chat.id,
-  );
+  const entries = [...scheduledBroadcasts.entries()];
 
   if (entries.length === 0) {
     await ctx.reply('Немає запланованих розсилок.');
@@ -676,7 +670,7 @@ bot.on('message', async (ctx) => {
     }
 
     if (sourceId !== undefined) {
-      if (sourceId === config.adminChatId) return;
+      if (config.adminChatIds.includes(sourceId)) return;
 
       const alreadyAdded = loadChats().some((c) => c.id === sourceId);
       if (alreadyAdded) {
@@ -851,9 +845,7 @@ bot.on('callback_query:data', async (ctx) => {
     }
 
     // Refresh the /scheduled list in-place
-    const remaining = [...scheduledBroadcasts.entries()].filter(
-      ([, s]) => s.adminChatId === chatId,
-    );
+    const remaining = [...scheduledBroadcasts.entries()];
     if (remaining.length === 0) {
       await ctx.editMessageText('✅ Скасовано. Немає більше запланованих розсилок.');
     } else {
@@ -1028,11 +1020,5 @@ bot.catch((err) => {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
-  bot.api
-    .sendMessage(
-      config.adminChatId,
-      `⚠️ <b>Системна помилка:</b>\n<code>${escaped}</code>`,
-      { parse_mode: 'HTML' },
-    )
-    .catch(() => {});
+  notifyAdmins(`⚠️ <b>Системна помилка:</b>\n<code>${escaped}</code>`, { parse_mode: 'HTML' });
 });
