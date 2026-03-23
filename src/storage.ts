@@ -22,7 +22,9 @@ function loadAllChats(): ChatRecord[] {
 
 function saveChats(chats: ChatRecord[]): void {
   ensureDataDir();
-  fs.writeFileSync(DATA_FILE, JSON.stringify(chats, null, 2), 'utf-8');
+  const tmp = DATA_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(chats, null, 2), 'utf-8');
+  fs.renameSync(tmp, DATA_FILE); // atomic on POSIX — prevents corruption on crash
 }
 
 /** Active chats only (no removedAt). Used for broadcasts, /list, etc. */
@@ -111,6 +113,22 @@ export function updateLastBroadcast(chatId: number): void {
     chat.lastBroadcast = new Date().toISOString();
     saveChats(chats);
   }
+}
+
+/** Batch-update lastBroadcast for multiple chats in a single file write. */
+export function updateLastBroadcastBatch(chatIds: number[]): void {
+  if (chatIds.length === 0) return;
+  const chats = loadAllChats();
+  const idSet = new Set(chatIds);
+  const now = new Date().toISOString();
+  let changed = false;
+  for (const chat of chats) {
+    if (idSet.has(chat.id) && !chat.removedAt) {
+      chat.lastBroadcast = now;
+      changed = true;
+    }
+  }
+  if (changed) saveChats(chats);
 }
 
 /** Returns ISO string of the most recent broadcast across all active chats, or null. */

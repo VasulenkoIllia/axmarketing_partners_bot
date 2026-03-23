@@ -7,6 +7,13 @@ import { timeAgo, formatTime, nextOccurrenceOf, isTomorrow, token } from './util
 
 export const bot = new Bot(config.botToken);
 
+// Cached bot ID — fetched once on first use
+let _botId: number | undefined;
+async function getBotId(): Promise<number> {
+  if (!_botId) _botId = (await bot.api.getMe()).id;
+  return _botId;
+}
+
 // ─── Message helpers ──────────────────────────────────────────────────────────
 
 /** Splits text on blank lines and sends in multiple messages if > 4000 chars. */
@@ -22,13 +29,15 @@ async function sendLong(
   }
   const blocks = text.split('\n\n');
   let chunk = '';
+  const { reply_markup, ...optsWithoutMarkup } = opts as Record<string, unknown>;
   for (const block of blocks) {
     if (chunk.length + block.length + 2 > MAX) {
-      await bot.api.sendMessage(chatId, chunk.trim(), opts);
+      await bot.api.sendMessage(chatId, chunk.trim(), optsWithoutMarkup as typeof opts);
       chunk = '';
     }
     chunk += (chunk ? '\n\n' : '') + block;
   }
+  // Only the last chunk gets the reply_markup
   if (chunk.trim()) await bot.api.sendMessage(chatId, chunk.trim(), opts);
 }
 
@@ -403,7 +412,7 @@ async function addChatById(adminChatId: number, targetChatId: number): Promise<v
   }
 
   try {
-    const botId = (await bot.api.getMe()).id;
+    const botId = await getBotId();
     const [chatInfo, memberInfo] = await Promise.all([
       bot.api.getChat(targetChatId),
       bot.api.getChatMember(targetChatId, botId),
@@ -1015,12 +1024,15 @@ bot.on('callback_query:data', async (ctx) => {
 
 bot.catch((err) => {
   console.error('[Bot error]', err);
-  // Notify admin so errors don't go unnoticed
+  const escaped = String(err.message ?? err)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
   bot.api
     .sendMessage(
       config.adminChatId,
-      `⚠️ <b>Системна помилка:</b>\n<code>${String(err.message ?? err)}</code>`,
+      `⚠️ <b>Системна помилка:</b>\n<code>${escaped}</code>`,
       { parse_mode: 'HTML' },
     )
-    .catch(() => {}); // don't loop if the notification itself fails
+    .catch(() => {});
 });

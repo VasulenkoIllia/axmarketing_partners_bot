@@ -32,7 +32,11 @@ export function nextOccurrenceOf(hour: number, minute: number): Date {
 export function isTomorrow(date: Date): boolean {
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
-  return date.getDate() === tomorrow.getDate();
+  return (
+    date.getFullYear() === tomorrow.getFullYear() &&
+    date.getMonth() === tomorrow.getMonth() &&
+    date.getDate() === tomorrow.getDate()
+  );
 }
 
 export function token(): string {

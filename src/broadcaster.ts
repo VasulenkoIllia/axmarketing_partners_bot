@@ -1,6 +1,6 @@
 import { Bot, GrammyError } from 'grammy';
 import { ChatRecord, BroadcastResult } from './types';
-import { updateLastBroadcast, migrateChat } from './storage';
+import { updateLastBroadcastBatch, migrateChat } from './storage';
 
 const DELAY_MS = 100; // ~10 msg/sec — well within Telegram limits
 
@@ -69,11 +69,12 @@ export async function broadcast(
   messageId: number,
 ): Promise<BroadcastResult> {
   const result: BroadcastResult = { success: 0, failed: 0, errors: [], deadChatIds: [] };
+  const succeededIds: number[] = [];
 
   for (const chat of chats) {
     try {
       const usedChatId = await tryCopyMessage(bot, chat, sourceChatId, messageId);
-      updateLastBroadcast(usedChatId);
+      succeededIds.push(usedChatId);
       result.success++;
     } catch (err: unknown) {
       result.failed++;
@@ -85,6 +86,9 @@ export async function broadcast(
     }
     await sleep(DELAY_MS);
   }
+
+  // Single file write for all lastBroadcast updates
+  updateLastBroadcastBatch(succeededIds);
 
   return result;
 }
