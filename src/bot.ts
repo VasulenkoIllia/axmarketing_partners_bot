@@ -61,6 +61,32 @@ const broadcastSessions = new Map<number, BroadcastSession>();
 /** Pending scheduled broadcasts keyed by token. Multiple per admin are allowed. */
 const scheduledBroadcasts = new Map<string, ScheduledBroadcast>();
 
+/**
+ * Tokens of cancelled scheduled broadcasts.
+ * Used to stop already-started chained setTimeout chains safely.
+ */
+const cancelledScheduleTokens = new Set<string>();
+
+/**
+ * setTimeout wrapper that handles delays beyond the ~24.8-day Node.js limit (2^31-1 ms).
+ * Uses a chain of MAX-delay timeouts. Cancelled via cancelledScheduleTokens.
+ */
+function safeTimeout(fn: () => void, delayMs: number, schedToken: string): ReturnType<typeof setTimeout> {
+  const MAX = 2_147_483_647; // 2^31 - 1 ms ≈ 24.8 days
+  const chunk = Math.min(delayMs, MAX);
+  return setTimeout(() => {
+    if (cancelledScheduleTokens.has(schedToken)) {
+      cancelledScheduleTokens.delete(schedToken);
+      return;
+    }
+    if (delayMs > MAX) {
+      safeTimeout(fn, delayMs - MAX, schedToken);
+    } else {
+      fn();
+    }
+  }, chunk);
+}
+
 /** Dead chat IDs found by /checkchats, keyed by admin chatId. */
 const checkchatsDeadIds = new Map<number, number[]>();
 
@@ -612,18 +638,12 @@ bot.on('message', async (ctx) => {
       return;
     }
 
-    // Must be today or in the future (within 30 days)
+    // Must be today or in the future
     const now = new Date();
     const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const maxDate = new Date(todayMidnight);
-    maxDate.setDate(maxDate.getDate() + 30);
 
     if (parsed < todayMidnight) {
       await ctx.reply('Ця дата вже минула. Введіть майбутню дату.\n\n/cancel — скасувати');
-      return;
-    }
-    if (parsed > maxDate) {
-      await ctx.reply('Можна планувати не більше ніж на 30 днів наперед.\n\n/cancel — скасувати');
       return;
     }
 
@@ -687,10 +707,10 @@ bot.on('message', async (ctx) => {
     const adminChatId = ctx.chat.id;
     const schedToken = token();
 
-    const timerHandle = setTimeout(async () => {
+    const timerHandle = safeTimeout(() => {
       scheduledBroadcasts.delete(schedToken);
-      await executeBroadcast(adminChatId, undefined, capturedSession);
-    }, delayMs);
+      executeBroadcast(adminChatId, undefined, capturedSession).catch(console.error);
+    }, delayMs, schedToken);
 
     const statusMsg = await ctx.reply(
       `⏰ Заплановано: <b>${fireLabel}</b>.\n/scheduled — керувати розсилками`,
@@ -898,6 +918,7 @@ bot.on('callback_query:data', async (ctx) => {
     const schedToken = data.slice('cancel_sched_'.length);
     const sched = scheduledBroadcasts.get(schedToken);
     if (sched) {
+      cancelledScheduleTokens.add(schedToken);
       clearTimeout(sched.timerHandle);
       scheduledBroadcasts.delete(schedToken);
       await bot.api
@@ -1054,7 +1075,7 @@ bot.on('callback_query:data', async (ctx) => {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
     waitingForDateInput.add(chatId);
     await ctx.editMessageText(
-      '📅 Введіть дату у форматі <b>ДД.ММ</b> або <b>ДД.ММ.РРРР</b>\nНаприклад: <code>25.04</code> або <code>25.04.2026</code>\n\nМожна планувати до 30 днів наперед.\n\n/cancel — скасувати',
+      '📅 Введіть дату у форматі <b>ДД.ММ</b> або <b>ДД.ММ.РРРР</b>\nНаприклад: <code>25.04</code> або <code>25.04.2026</code>\n\n/cancel — скасувати',
       { parse_mode: 'HTML' },
     );
     await ctx.answerCallbackQuery();
@@ -1075,13 +1096,11 @@ bot.on('callback_query:data', async (ctx) => {
     const fireLabel = formatScheduleLabel(fireAt);
     const schedToken = token();
 
-    const timerHandle = setTimeout(async () => {
+    const timerHandle = safeTimeout(() => {
       scheduledBroadcasts.delete(schedToken);
-      if (msgId) {
-        await bot.api.deleteMessage(chatId, msgId).catch(() => {});
-      }
-      await executeBroadcast(chatId, undefined, capturedSession);
-    }, delayMs);
+      if (msgId) bot.api.deleteMessage(chatId, msgId).catch(() => {});
+      executeBroadcast(chatId, undefined, capturedSession).catch(console.error);
+    }, delayMs, schedToken);
 
     scheduledBroadcasts.set(schedToken, {
       adminChatId: chatId,
