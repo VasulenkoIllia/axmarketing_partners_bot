@@ -33,3 +33,14 @@ export interface BroadcastSession {
   selectedChatIds: Set<number>; // managed during subset selection
   isSelecting: boolean;
 }
+
+/** Persisted form of a scheduled broadcast (survives bot restarts). */
+export interface PersistedSchedule {
+  token: string;
+  adminChatId: number;
+  pending: PendingBroadcast;
+  scheduledFor: string;         // ISO date string
+  label: string;
+  statusMessageId: number;
+  selectedChatIds: number[] | null; // null = all chats at fire time
+}

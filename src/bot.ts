@@ -1,8 +1,8 @@
 import { Bot, InlineKeyboard } from 'grammy';
 import { config } from './config';
-import { addChat, removeChat, removeChats, restoreChat, loadChats, loadRemovedChats, getLastGlobalBroadcast } from './storage';
+import { addChat, removeChat, removeChats, restoreChat, loadChats, loadRemovedChats, getLastGlobalBroadcast, loadScheduled, saveScheduled, addScheduledEntry, removeScheduledEntry } from './storage';
 import { broadcast } from './broadcaster';
-import { BroadcastSession, ChatRecord, ScheduledBroadcast } from './types';
+import { BroadcastSession, ChatRecord, PersistedSchedule, ScheduledBroadcast } from './types';
 import { timeAgo, formatTime, token, parseDate, formatDateLabel, formatScheduleLabel } from './utils';
 
 export const bot = new Bot(config.botToken);
@@ -220,7 +220,7 @@ async function executeBroadcast(
   session: BroadcastSession,
 ): Promise<void> {
   const allChats = loadChats();
-  const targets = session.selectedChatIds.size < allChats.length
+  const targets = session.selectedChatIds.size > 0
     ? allChats.filter((c) => session.selectedChatIds.has(c.id))
     : allChats;
 
@@ -521,6 +521,11 @@ bot.command('broadcast', async (ctx) => {
     return;
   }
 
+  if (waitingForContent.has(ctx.chat.id) || broadcastSessions.has(ctx.chat.id)) {
+    await ctx.reply('⚠️ Вже є активна розсилка. Скасуйте її /cancel перед початком нової.');
+    return;
+  }
+
   waitingForContent.add(ctx.chat.id);
   waitingForTimeInput.delete(ctx.chat.id);
   waitingForDateInput.delete(ctx.chat.id);
@@ -709,13 +714,22 @@ bot.on('message', async (ctx) => {
 
     const timerHandle = safeTimeout(() => {
       scheduledBroadcasts.delete(schedToken);
-      executeBroadcast(adminChatId, undefined, capturedSession).catch(console.error);
+      removeScheduledEntry(schedToken);
+      executeBroadcast(adminChatId, undefined, capturedSession).catch((err) => {
+        console.error('[Scheduled broadcast error]', err);
+        notifyAdmins(`⚠️ Помилка запланованої розсилки <b>${fireLabel}</b>:\n<code>${String(err).slice(0, 500)}</code>`, { parse_mode: 'HTML' });
+      });
     }, delayMs, schedToken);
 
     const statusMsg = await ctx.reply(
       `⏰ Заплановано: <b>${fireLabel}</b>.\n/scheduled — керувати розсилками`,
       { parse_mode: 'HTML' },
     );
+
+    const allChats = loadChats();
+    const persistedChatIds = capturedSession.selectedChatIds.size < allChats.length
+      ? [...capturedSession.selectedChatIds]
+      : null;
 
     scheduledBroadcasts.set(schedToken, {
       adminChatId,
@@ -724,6 +738,15 @@ bot.on('message', async (ctx) => {
       label: fireLabel,
       statusMessageId: statusMsg.message_id,
       timerHandle,
+    });
+    addScheduledEntry({
+      token: schedToken,
+      adminChatId,
+      pending: session.pending,
+      scheduledFor: fireAt.toISOString(),
+      label: fireLabel,
+      statusMessageId: statusMsg.message_id,
+      selectedChatIds: persistedChatIds,
     });
     return;
   }
@@ -921,6 +944,7 @@ bot.on('callback_query:data', async (ctx) => {
       cancelledScheduleTokens.add(schedToken);
       clearTimeout(sched.timerHandle);
       scheduledBroadcasts.delete(schedToken);
+      removeScheduledEntry(schedToken);
       await bot.api
         .editMessageText(chatId, sched.statusMessageId, `❌ Розсилку ${sched.label} скасовано.`)
         .catch(() => {});
@@ -1098,9 +1122,18 @@ bot.on('callback_query:data', async (ctx) => {
 
     const timerHandle = safeTimeout(() => {
       scheduledBroadcasts.delete(schedToken);
+      removeScheduledEntry(schedToken);
       if (msgId) bot.api.deleteMessage(chatId, msgId).catch(() => {});
-      executeBroadcast(chatId, undefined, capturedSession).catch(console.error);
+      executeBroadcast(chatId, undefined, capturedSession).catch((err) => {
+        console.error('[Scheduled broadcast error]', err);
+        notifyAdmins(`⚠️ Помилка запланованої розсилки <b>${fireLabel}</b>:\n<code>${String(err).slice(0, 500)}</code>`, { parse_mode: 'HTML' });
+      });
     }, delayMs, schedToken);
+
+    const allChats2 = loadChats();
+    const persistedChatIds2 = capturedSession.selectedChatIds.size < allChats2.length
+      ? [...capturedSession.selectedChatIds]
+      : null;
 
     scheduledBroadcasts.set(schedToken, {
       adminChatId: chatId,
@@ -1109,6 +1142,15 @@ bot.on('callback_query:data', async (ctx) => {
       label: fireLabel,
       statusMessageId: msgId ?? 0,
       timerHandle,
+    });
+    addScheduledEntry({
+      token: schedToken,
+      adminChatId: chatId,
+      pending: session.pending,
+      scheduledFor: fireAt.toISOString(),
+      label: fireLabel,
+      statusMessageId: msgId ?? 0,
+      selectedChatIds: persistedChatIds2,
     });
 
     await ctx.editMessageText(
@@ -1122,11 +1164,67 @@ bot.on('callback_query:data', async (ctx) => {
   await ctx.answerCallbackQuery();
 });
 
+// ─── Restore scheduled broadcasts after restart ───────────────────────────────
+
+export function restoreScheduledBroadcasts(): void {
+  const entries = loadScheduled();
+  if (entries.length === 0) return;
+
+  const now = Date.now();
+  const toKeep: PersistedSchedule[] = [];
+
+  for (const entry of entries) {
+    const fireAt = new Date(entry.scheduledFor);
+    const delayMs = fireAt.getTime() - now;
+
+    if (delayMs <= 0) {
+      console.log(`[Bot] Missed scheduled broadcast: ${entry.label}`);
+      notifyAdmins(
+        `⚠️ Пропущена запланована розсилка (бот перезапустився):\n⏰ <b>${entry.label}</b>\n\nЗапустіть /broadcast вручну якщо потрібно.`,
+        { parse_mode: 'HTML' },
+      );
+      continue;
+    }
+
+    const capturedSession: BroadcastSession = {
+      pending: entry.pending,
+      selectedChatIds: entry.selectedChatIds ? new Set(entry.selectedChatIds) : new Set(),
+      isSelecting: false,
+    };
+
+    const timerHandle = safeTimeout(() => {
+      scheduledBroadcasts.delete(entry.token);
+      removeScheduledEntry(entry.token);
+      executeBroadcast(entry.adminChatId, undefined, capturedSession).catch((err) => {
+        console.error('[Scheduled broadcast error]', err);
+        notifyAdmins(`⚠️ Помилка запланованої розсилки <b>${entry.label}</b>:\n<code>${String(err).slice(0, 500)}</code>`, { parse_mode: 'HTML' });
+      });
+    }, delayMs, entry.token);
+
+    scheduledBroadcasts.set(entry.token, {
+      adminChatId: entry.adminChatId,
+      pending: entry.pending,
+      scheduledFor: fireAt,
+      label: entry.label,
+      statusMessageId: entry.statusMessageId,
+      timerHandle,
+    });
+
+    console.log(`[Bot] Restored scheduled broadcast: ${entry.label} (in ${Math.round(delayMs / 60000)} min)`);
+    toKeep.push(entry);
+  }
+
+  if (toKeep.length !== entries.length) {
+    saveScheduled(toKeep);
+  }
+}
+
 // ─── Global error handler ─────────────────────────────────────────────────────
 
 bot.catch((err) => {
   console.error('[Bot error]', err);
-  const escaped = String(err.message ?? err)
+  const msg = String(err.message ?? err).slice(0, 1000);
+  const escaped = msg
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');

@@ -1,12 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import { ChatRecord } from './types';
+import { ChatRecord, PersistedSchedule } from './types';
 
-const DATA_FILE = path.join(process.cwd(), 'data', 'chats.json');
+const DATA_DIR = path.join(process.cwd(), 'data');
+const DATA_FILE = path.join(DATA_DIR, 'chats.json');
+const SCHEDULED_FILE = path.join(DATA_DIR, 'scheduled.json');
 
 function ensureDataDir(): void {
-  const dir = path.dirname(DATA_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
 /** All records including removed ones. */
@@ -129,6 +130,35 @@ export function updateLastBroadcastBatch(chatIds: number[]): void {
     }
   }
   if (changed) saveChats(chats);
+}
+
+// ─── Scheduled broadcasts persistence ─────────────────────────────────────────
+
+export function loadScheduled(): PersistedSchedule[] {
+  if (!fs.existsSync(SCHEDULED_FILE)) return [];
+  try {
+    return JSON.parse(fs.readFileSync(SCHEDULED_FILE, 'utf-8')) as PersistedSchedule[];
+  } catch {
+    return [];
+  }
+}
+
+export function saveScheduled(schedules: PersistedSchedule[]): void {
+  ensureDataDir();
+  const tmp = SCHEDULED_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(schedules, null, 2), 'utf-8');
+  fs.renameSync(tmp, SCHEDULED_FILE);
+}
+
+export function addScheduledEntry(entry: PersistedSchedule): void {
+  const all = loadScheduled();
+  all.push(entry);
+  saveScheduled(all);
+}
+
+export function removeScheduledEntry(token: string): void {
+  const all = loadScheduled().filter((s) => s.token !== token);
+  saveScheduled(all);
 }
 
 /** Returns ISO string of the most recent broadcast across all active chats, or null. */

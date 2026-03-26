@@ -1,4 +1,6 @@
-import { bot } from './bot';
+import { bot, restoreScheduledBroadcasts } from './bot';
+
+restoreScheduledBroadcasts();
 
 bot.start({
   allowed_updates: ['message', 'callback_query', 'my_chat_member'],
