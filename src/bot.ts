@@ -3,7 +3,7 @@ import { config } from './config';
 import { addChat, removeChat, removeChats, restoreChat, loadChats, loadRemovedChats, getLastGlobalBroadcast } from './storage';
 import { broadcast } from './broadcaster';
 import { BroadcastSession, ChatRecord, ScheduledBroadcast } from './types';
-import { timeAgo, formatTime, nextOccurrenceOf, token, parseDate, formatScheduleLabel } from './utils';
+import { timeAgo, formatTime, token, parseDate, formatDateLabel, formatScheduleLabel } from './utils';
 
 export const bot = new Bot(config.botToken);
 
@@ -631,9 +631,8 @@ bot.on('message', async (ctx) => {
     pendingScheduleDate.set(ctx.chat.id, parsed);
     waitingForTimeInput.add(ctx.chat.id);
 
-    const dayLabel = formatScheduleLabel(new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 12, 0));
     await ctx.reply(
-      `📅 Дата: <b>${dayLabel.replace(/ о .*/, '')}</b>\n\nТепер введіть час у форматі <b>ГГ:ХХ</b>\nНаприклад: <code>18:30</code>\n\n/cancel — скасувати`,
+      `📅 Дата: <b>${formatDateLabel(parsed)}</b>\n\nТепер введіть час у форматі <b>ГГ:ХХ</b>\nНаприклад: <code>18:30</code>\n\n/cancel — скасувати`,
       { parse_mode: 'HTML' },
     );
     return;
@@ -667,20 +666,15 @@ bot.on('message', async (ctx) => {
       return;
     }
 
-    // Build fireAt from chosen date (or today/tomorrow if no date was picked)
-    const chosenDate = pendingScheduleDate.get(ctx.chat.id);
-    let fireAt: Date;
-    if (chosenDate) {
-      fireAt = new Date(chosenDate);
-      fireAt.setHours(hour, minute, 0, 0);
-      if (fireAt.getTime() <= Date.now()) {
-        await ctx.reply(
-          '⚠️ Цей час вже минув для обраної дати. Введіть інший час.\n\n/cancel — скасувати',
-        );
-        return;
-      }
-    } else {
-      fireAt = nextOccurrenceOf(hour, minute);
+    // Build fireAt from chosen date
+    const chosenDate = pendingScheduleDate.get(ctx.chat.id) ?? new Date();
+    const fireAt = new Date(chosenDate);
+    fireAt.setHours(hour, minute, 0, 0);
+    if (fireAt.getTime() <= Date.now()) {
+      await ctx.reply(
+        '⚠️ Цей час вже минув. Введіть інший час.\n\n/cancel — скасувати',
+      );
+      return;
     }
 
     waitingForTimeInput.delete(ctx.chat.id);
@@ -1042,12 +1036,10 @@ bot.on('callback_query:data', async (ctx) => {
 
   if (data === 'sched_day_today' || data === 'sched_day_tomorrow') {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
-    if (data === 'sched_day_tomorrow') {
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      tomorrow.setHours(0, 0, 0, 0);
-      pendingScheduleDate.set(chatId, tomorrow);
-    }
+    const baseDate = new Date();
+    if (data === 'sched_day_tomorrow') baseDate.setDate(baseDate.getDate() + 1);
+    baseDate.setHours(0, 0, 0, 0);
+    pendingScheduleDate.set(chatId, baseDate);
     waitingForTimeInput.add(chatId);
     const dayName = data === 'sched_day_today' ? 'Сьогодні' : 'Завтра';
     await ctx.editMessageText(

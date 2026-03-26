@@ -29,16 +29,6 @@ export function nextOccurrenceOf(hour: number, minute: number): Date {
   return d;
 }
 
-export function isTomorrow(date: Date): boolean {
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  return (
-    date.getFullYear() === tomorrow.getFullYear() &&
-    date.getMonth() === tomorrow.getMonth() &&
-    date.getDate() === tomorrow.getDate()
-  );
-}
-
 export function token(): string {
   return crypto.randomBytes(4).toString('hex');
 }
@@ -70,18 +60,21 @@ const MONTHS_UK = [
 ];
 
 /**
+ * Human-readable day label (no time): "сьогодні" / "завтра" / "25 квітня" / "25 квітня 2027"
+ */
+export function formatDateLabel(date: Date): string {
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) return 'сьогодні';
+  const tomorrow = new Date(now);
+  tomorrow.setDate(now.getDate() + 1);
+  if (date.toDateString() === tomorrow.toDateString()) return 'завтра';
+  const yearStr = date.getFullYear() !== now.getFullYear() ? ` ${date.getFullYear()}` : '';
+  return `${date.getDate()} ${MONTHS_UK[date.getMonth()]}${yearStr}`;
+}
+
+/**
  * Human-readable schedule label: "сьогодні о 18:30" / "завтра о 18:30" / "25 квітня о 18:30"
  */
 export function formatScheduleLabel(date: Date): string {
-  const now = new Date();
-  const timeStr = formatTime(date);
-
-  if (date.toDateString() === now.toDateString()) return `сьогодні о ${timeStr}`;
-
-  const tomorrow = new Date(now);
-  tomorrow.setDate(now.getDate() + 1);
-  if (date.toDateString() === tomorrow.toDateString()) return `завтра о ${timeStr}`;
-
-  const yearStr = date.getFullYear() !== now.getFullYear() ? ` ${date.getFullYear()}` : '';
-  return `${date.getDate()} ${MONTHS_UK[date.getMonth()]}${yearStr} о ${timeStr}`;
+  return `${formatDateLabel(date)} о ${formatTime(date)}`;
 }
