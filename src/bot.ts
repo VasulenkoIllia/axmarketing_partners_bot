@@ -3,7 +3,7 @@ import { config } from './config';
 import { addChat, removeChat, removeChats, restoreChat, loadChats, loadRemovedChats, getLastGlobalBroadcast, loadScheduled, saveScheduled, addScheduledEntry, removeScheduledEntry } from './storage';
 import { broadcast } from './broadcaster';
 import { BroadcastSession, ChatRecord, PersistedSchedule, ScheduledBroadcast } from './types';
-import { timeAgo, formatTime, token, parseDate, formatDateLabel, formatScheduleLabel } from './utils';
+import { timeAgo, formatTime, token, parseDate, formatDateLabel, formatScheduleLabel, escapeHtml } from './utils';
 
 export const bot = new Bot(config.botToken);
 
@@ -668,16 +668,22 @@ bot.on('message', async (ctx) => {
     if (!session || !session.selectionMsgId) return;
     const query = ('text' in ctx.message ? ctx.message.text?.trim() : '') ?? '';
     session.searchQuery = query || undefined;
+    // Clean up: delete user's search input + our prompt message
     await bot.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
+    if (session.searchPromptMsgId) {
+      await bot.api.deleteMessage(ctx.chat.id, session.searchPromptMsgId).catch(() => {});
+      delete session.searchPromptMsgId;
+    }
     const allChats = loadChats();
     const found = query
       ? allChats.filter((c) => c.title.toLowerCase().includes(query.toLowerCase()))
       : allChats;
+    const safeQuery = escapeHtml(query);
     await bot.api.editMessageText(
       ctx.chat.id,
       session.selectionMsgId,
       query
-        ? `Виберіть чати для розсилки:\n<i>Пошук: "${query}" — ${found.length} з ${allChats.length} | Вибрано: ${session.selectedChatIds.size}</i>`
+        ? `Виберіть чати для розсилки:\n<i>Пошук: "${safeQuery}" — ${found.length} з ${allChats.length} | Вибрано: ${session.selectedChatIds.size}</i>`
         : `Виберіть чати для розсилки:\n<i>${allChats.length} чат(ів) | Вибрано: ${session.selectedChatIds.size}</i>`,
       { parse_mode: 'HTML', reply_markup: buildSubsetKeyboard(session, allChats) },
     );
@@ -1062,7 +1068,7 @@ bot.on('callback_query:data', async (ctx) => {
     const visibleCount = query
       ? allChats.filter((c) => c.title.toLowerCase().includes(query.toLowerCase())).length
       : allChats.length;
-    const headerQuery = query ? `Пошук: "${query}" — ${visibleCount} чат(ів)` : `${allChats.length} чат(ів)`;
+    const headerQuery = query ? `Пошук: "${escapeHtml(query)}" — ${visibleCount} чат(ів)` : `${allChats.length} чат(ів)`;
     await ctx.editMessageText(
       `Виберіть чати для розсилки:\n<i>${headerQuery} | Вибрано: ${session.selectedChatIds.size}</i>`,
       { parse_mode: 'HTML', reply_markup: buildSubsetKeyboard(session, allChats) },
@@ -1101,7 +1107,8 @@ bot.on('callback_query:data', async (ctx) => {
     session.selectionMsgId = ctx.callbackQuery.message?.message_id;
     waitingForSubsetSearch.add(chatId);
     await ctx.answerCallbackQuery();
-    await bot.api.sendMessage(chatId, '🔍 Введіть текст для пошуку:');
+    const promptMsg = await bot.api.sendMessage(chatId, '🔍 Введіть текст для пошуку:\n/cancel — скасувати пошук');
+    session.searchPromptMsgId = promptMsg.message_id;
     return;
   }
 

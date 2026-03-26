@@ -33,6 +33,11 @@ export function token(): string {
   return crypto.randomBytes(4).toString('hex');
 }
 
+/** Escape user-supplied strings for safe embedding in HTML parse_mode messages. */
+export function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 /**
  * Parses a date string in DD.MM or DD.MM.YYYY format.
  * Returns a Date at midnight (local time) or null if invalid.
