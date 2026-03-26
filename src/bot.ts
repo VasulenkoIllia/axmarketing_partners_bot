@@ -3,7 +3,7 @@ import { config } from './config';
 import { addChat, removeChat, removeChats, restoreChat, loadChats, loadRemovedChats, getLastGlobalBroadcast } from './storage';
 import { broadcast } from './broadcaster';
 import { BroadcastSession, ChatRecord, ScheduledBroadcast } from './types';
-import { timeAgo, formatTime, nextOccurrenceOf, isTomorrow, token } from './utils';
+import { timeAgo, formatTime, nextOccurrenceOf, token, parseDate, formatScheduleLabel } from './utils';
 
 export const bot = new Bot(config.botToken);
 
@@ -46,8 +46,14 @@ async function sendLong(
 /** Admin is currently expected to send broadcast content. */
 const waitingForContent = new Set<number>();
 
-/** Admin typed "Свій час" and we expect a HH:MM reply next. */
-const waitingForCustomTime = new Set<number>();
+/** Admin chose a day/date and we expect a HH:MM reply next. */
+const waitingForTimeInput = new Set<number>();
+
+/** Admin chose "Інша дата" and we expect a DD.MM[.YYYY] reply next. */
+const waitingForDateInput = new Set<number>();
+
+/** Stores the chosen date (midnight) while admin is entering the time. */
+const pendingScheduleDate = new Map<number, Date>();
 
 /** Active broadcast session (pending content + subset selection). */
 const broadcastSessions = new Map<number, BroadcastSession>();
@@ -490,7 +496,9 @@ bot.command('broadcast', async (ctx) => {
   }
 
   waitingForContent.add(ctx.chat.id);
-  waitingForCustomTime.delete(ctx.chat.id);
+  waitingForTimeInput.delete(ctx.chat.id);
+  waitingForDateInput.delete(ctx.chat.id);
+  pendingScheduleDate.delete(ctx.chat.id);
   broadcastSessions.delete(ctx.chat.id);
 
   await ctx.reply(
@@ -511,7 +519,9 @@ bot.command('cancel', async (ctx) => {
   const hadSession = broadcastSessions.has(chatId);
 
   waitingForContent.delete(chatId);
-  waitingForCustomTime.delete(chatId);
+  waitingForTimeInput.delete(chatId);
+  waitingForDateInput.delete(chatId);
+  pendingScheduleDate.delete(chatId);
   broadcastSessions.delete(chatId);
 
   if (hadContent || hadSession) {
@@ -589,16 +599,56 @@ bot.on('message', async (ctx) => {
   if (!isAdmin(ctx.chat.id)) return;
   if ('text' in ctx.message && ctx.message.text?.startsWith('/')) return;
 
-  // ── Custom time input ────────────────────────────────────────────────────────
-  if (waitingForCustomTime.has(ctx.chat.id)) {
+  // ── Date input (DD.MM or DD.MM.YYYY) ─────────────────────────────────────────
+  if (waitingForDateInput.has(ctx.chat.id)) {
+    const text = ('text' in ctx.message ? ctx.message.text?.trim() : '') ?? '';
+    const parsed = parseDate(text);
+
+    if (!parsed) {
+      await ctx.reply(
+        'Невірний формат. Введіть дату як <b>ДД.ММ</b> або <b>ДД.ММ.РРРР</b>\nНаприклад: <code>25.04</code> або <code>25.04.2026</code>\n\n/cancel — скасувати',
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    // Must be today or in the future (within 30 days)
+    const now = new Date();
+    const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const maxDate = new Date(todayMidnight);
+    maxDate.setDate(maxDate.getDate() + 30);
+
+    if (parsed < todayMidnight) {
+      await ctx.reply('Ця дата вже минула. Введіть майбутню дату.\n\n/cancel — скасувати');
+      return;
+    }
+    if (parsed > maxDate) {
+      await ctx.reply('Можна планувати не більше ніж на 30 днів наперед.\n\n/cancel — скасувати');
+      return;
+    }
+
+    waitingForDateInput.delete(ctx.chat.id);
+    pendingScheduleDate.set(ctx.chat.id, parsed);
+    waitingForTimeInput.add(ctx.chat.id);
+
+    const dayLabel = formatScheduleLabel(new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 12, 0));
+    await ctx.reply(
+      `📅 Дата: <b>${dayLabel.replace(/ о .*/, '')}</b>\n\nТепер введіть час у форматі <b>ГГ:ХХ</b>\nНаприклад: <code>18:30</code>\n\n/cancel — скасувати`,
+      { parse_mode: 'HTML' },
+    );
+    return;
+  }
+
+  // ── Time input (HH:MM) ────────────────────────────────────────────────────────
+  if (waitingForTimeInput.has(ctx.chat.id)) {
     const text = ('text' in ctx.message ? ctx.message.text?.trim() : '') ?? '';
     const match = text.match(/^(\d{1,2}):(\d{2})$/);
 
     if (!match) {
-      await ctx.reply('Невірний формат. Введіть час як <b>ГГ:ХХ</b>, наприклад: <code>18:30</code>', {
+      await ctx.reply('Невірний формат. Введіть час як <b>ГГ:ХХ</b>, наприклад: <code>18:30</code>\n\n/cancel — скасувати', {
         parse_mode: 'HTML',
       });
-      return; // stay in waitingForCustomTime
+      return;
     }
 
     const hour = parseInt(match[1], 10);
@@ -611,17 +661,34 @@ bot.on('message', async (ctx) => {
 
     const session = broadcastSessions.get(ctx.chat.id);
     if (!session) {
-      waitingForCustomTime.delete(ctx.chat.id);
+      waitingForTimeInput.delete(ctx.chat.id);
+      pendingScheduleDate.delete(ctx.chat.id);
       await ctx.reply('Сесія закінчилась. Почніть /broadcast заново.');
       return;
     }
 
-    waitingForCustomTime.delete(ctx.chat.id);
+    // Build fireAt from chosen date (or today/tomorrow if no date was picked)
+    const chosenDate = pendingScheduleDate.get(ctx.chat.id);
+    let fireAt: Date;
+    if (chosenDate) {
+      fireAt = new Date(chosenDate);
+      fireAt.setHours(hour, minute, 0, 0);
+      if (fireAt.getTime() <= Date.now()) {
+        await ctx.reply(
+          '⚠️ Цей час вже минув для обраної дати. Введіть інший час.\n\n/cancel — скасувати',
+        );
+        return;
+      }
+    } else {
+      fireAt = nextOccurrenceOf(hour, minute);
+    }
+
+    waitingForTimeInput.delete(ctx.chat.id);
+    pendingScheduleDate.delete(ctx.chat.id);
     broadcastSessions.delete(ctx.chat.id);
 
-    const fireAt = nextOccurrenceOf(hour, minute);
     const delayMs = fireAt.getTime() - Date.now();
-    const fireLabel = formatTime(fireAt) + (isTomorrow(fireAt) ? ' (завтра)' : ' (сьогодні)');
+    const fireLabel = formatScheduleLabel(fireAt);
     const capturedSession = { ...session, selectedChatIds: new Set(session.selectedChatIds) };
     const adminChatId = ctx.chat.id;
     const schedToken = token();
@@ -632,7 +699,7 @@ bot.on('message', async (ctx) => {
     }, delayMs);
 
     const statusMsg = await ctx.reply(
-      `⏰ Заплановано на <b>${fireLabel}</b>.\n/scheduled — керувати розсилками`,
+      `⏰ Заплановано: <b>${fireLabel}</b>.\n/scheduled — керувати розсилками`,
       { parse_mode: 'HTML' },
     );
 
@@ -961,9 +1028,41 @@ bot.on('callback_query:data', async (ctx) => {
   // ── Custom time: prompt for HH:MM input ──────────────────────────────────────
   if (data === 'sched_custom') {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
-    waitingForCustomTime.add(chatId);
+    const dayPicker = new InlineKeyboard()
+      .text('Сьогодні', 'sched_day_today').text('Завтра', 'sched_day_tomorrow').row()
+      .text('📅 Інша дата', 'sched_day_pick').row()
+      .text('❌ Скасувати', 'cancel');
     await ctx.editMessageText(
-      'Введіть час у форматі <b>ГГ:ХХ</b>\nНаприклад: <code>18:30</code>\n\n/cancel — скасувати',
+      '📅 Оберіть день для розсилки:',
+      { reply_markup: dayPicker },
+    );
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (data === 'sched_day_today' || data === 'sched_day_tomorrow') {
+    if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
+    if (data === 'sched_day_tomorrow') {
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(0, 0, 0, 0);
+      pendingScheduleDate.set(chatId, tomorrow);
+    }
+    waitingForTimeInput.add(chatId);
+    const dayName = data === 'sched_day_today' ? 'Сьогодні' : 'Завтра';
+    await ctx.editMessageText(
+      `📅 ${dayName}\n\nВведіть час у форматі <b>ГГ:ХХ</b>\nНаприклад: <code>18:30</code>\n\n/cancel — скасувати`,
+      { parse_mode: 'HTML' },
+    );
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (data === 'sched_day_pick') {
+    if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
+    waitingForDateInput.add(chatId);
+    await ctx.editMessageText(
+      '📅 Введіть дату у форматі <b>ДД.ММ</b> або <b>ДД.ММ.РРРР</b>\nНаприклад: <code>25.04</code> або <code>25.04.2026</code>\n\nМожна планувати до 30 днів наперед.\n\n/cancel — скасувати',
       { parse_mode: 'HTML' },
     );
     await ctx.answerCallbackQuery();
@@ -981,7 +1080,7 @@ bot.on('callback_query:data', async (ctx) => {
     const capturedSession = { ...session, selectedChatIds: new Set(session.selectedChatIds) };
     broadcastSessions.delete(chatId);
 
-    const fireLabel = formatTime(fireAt) + (isTomorrow(fireAt) ? ' (завтра)' : ' (сьогодні)');
+    const fireLabel = formatScheduleLabel(fireAt);
     const schedToken = token();
 
     const timerHandle = setTimeout(async () => {
