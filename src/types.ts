@@ -32,6 +32,8 @@ export interface BroadcastSession {
   pending: PendingBroadcast;
   selectedChatIds: Set<number>; // managed during subset selection
   isSelecting: boolean;
+  searchQuery?: string;     // active filter in subset keyboard
+  selectionMsgId?: number;  // message ID of the selection keyboard (for search + back button)
 }
 
 /** Persisted form of a scheduled broadcast (survives bot restarts). */

@@ -58,6 +58,9 @@ const pendingScheduleDate = new Map<number, Date>();
 /** Active broadcast session (pending content + subset selection). */
 const broadcastSessions = new Map<number, BroadcastSession>();
 
+/** Admin tapped 🔍 Пошук — next text message becomes the search query. */
+const waitingForSubsetSearch = new Set<number>();
+
 /** Pending scheduled broadcasts keyed by token. Multiple per admin are allowed. */
 const scheduledBroadcasts = new Map<string, ScheduledBroadcast>();
 
@@ -159,32 +162,59 @@ function buildConfirmKeyboard(count: number): InlineKeyboard {
     .text('❌ Скасувати', 'cancel_broadcast');
 }
 
-/** Shown after subset is confirmed — uses broadcast_selected to preserve the selection. */
-function buildSubsetConfirmKeyboard(count: number): InlineKeyboard {
+/** Shown after subset selection is confirmed — shows names + schedule options. */
+function buildSubsetConfirmKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
-    .text(`✅ Надіслати вибраним (${count})`, 'broadcast_selected')
-    .row()
+    .text('✅ Надіслати зараз', 'broadcast_selected').row()
     .text('⏰ 30 хв', 'sched_30')
     .text('⏰ 1 год', 'sched_60')
     .text('⏰ 2 год', 'sched_120')
-    .text('🕐 Свій час', 'sched_custom')
-    .row()
+    .text('🕐 Свій час', 'sched_custom').row()
+    .text('⬅️ Змінити вибір', 'broadcast_back_select').row()
     .text('❌ Скасувати', 'cancel_broadcast');
 }
 
-function buildSubsetKeyboard(session: BroadcastSession): InlineKeyboard {
-  const chats = loadChats();
+function buildSubsetKeyboard(session: BroadcastSession, allChats?: ChatRecord[]): InlineKeyboard {
+  const chats = allChats ?? loadChats();
+  const query = session.searchQuery?.toLowerCase().trim();
+  const visible = query ? chats.filter((c) => c.title.toLowerCase().includes(query)) : chats;
+
   const kb = new InlineKeyboard();
-  for (const chat of chats) {
-    const icon = session.selectedChatIds.has(chat.id) ? '☑️' : '☐';
-    kb.text(`${icon} ${chat.title}`, `subset_toggle_${chat.id}`).row();
+
+  // Search row
+  if (query) {
+    kb.text(`🔍 "${session.searchQuery}"  ✖️ скинути`, 'subset_search_clear').row();
+  } else {
+    kb.text('🔍 Пошук по назві', 'subset_search').row();
   }
-  kb.text('☑️ Всі', 'subset_all').text('☐ Жодного', 'subset_none').row();
+
+  if (visible.length === 0) {
+    kb.text('— нічого не знайдено —', 'noop').row();
+  } else {
+    for (const chat of visible) {
+      const icon = session.selectedChatIds.has(chat.id) ? '☑️' : '☐';
+      const label = chat.title.length > 26 ? chat.title.slice(0, 25) + '…' : chat.title;
+      kb.text(`${icon} ${label}`, `subset_toggle_${chat.id}`).row();
+    }
+  }
+
+  if (!query) {
+    kb.text('☑️ Всі', 'subset_all').text('☐ Жодного', 'subset_none').row();
+  }
+
   if (session.selectedChatIds.size > 0) {
-    kb.text(`✅ Відіслати вибраним (${session.selectedChatIds.size})`, 'subset_done').row();
+    kb.text(`✅ Готово — вибрано ${session.selectedChatIds.size}`, 'subset_done').row();
   }
   kb.text('❌ Скасувати', 'cancel_broadcast');
   return kb;
+}
+
+/** Returns a preview list of chat names for confirmation screens. */
+function buildChatPreview(chats: ChatRecord[]): string {
+  const MAX = 5;
+  const lines = chats.slice(0, MAX).map((c) => `• ${c.title}`);
+  if (chats.length > MAX) lines.push(`<i>...ще ${chats.length - MAX}</i>`);
+  return lines.join('\n');
 }
 
 function buildReport(
@@ -552,6 +582,7 @@ bot.command('cancel', async (ctx) => {
   waitingForContent.delete(chatId);
   waitingForTimeInput.delete(chatId);
   waitingForDateInput.delete(chatId);
+  waitingForSubsetSearch.delete(chatId);
   pendingScheduleDate.delete(chatId);
   broadcastSessions.delete(chatId);
 
@@ -629,6 +660,29 @@ bot.command('removedchats', async (ctx) => {
 bot.on('message', async (ctx) => {
   if (!isAdmin(ctx.chat.id)) return;
   if ('text' in ctx.message && ctx.message.text?.startsWith('/')) return;
+
+  // ── Subset search query ───────────────────────────────────────────────────────
+  if (waitingForSubsetSearch.has(ctx.chat.id)) {
+    waitingForSubsetSearch.delete(ctx.chat.id);
+    const session = broadcastSessions.get(ctx.chat.id);
+    if (!session || !session.selectionMsgId) return;
+    const query = ('text' in ctx.message ? ctx.message.text?.trim() : '') ?? '';
+    session.searchQuery = query || undefined;
+    await bot.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
+    const allChats = loadChats();
+    const found = query
+      ? allChats.filter((c) => c.title.toLowerCase().includes(query.toLowerCase()))
+      : allChats;
+    await bot.api.editMessageText(
+      ctx.chat.id,
+      session.selectionMsgId,
+      query
+        ? `Виберіть чати для розсилки:\n<i>Пошук: "${query}" — ${found.length} з ${allChats.length} | Вибрано: ${session.selectedChatIds.size}</i>`
+        : `Виберіть чати для розсилки:\n<i>${allChats.length} чат(ів) | Вибрано: ${session.selectedChatIds.size}</i>`,
+      { parse_mode: 'HTML', reply_markup: buildSubsetKeyboard(session, allChats) },
+    );
+    return;
+  }
 
   // ── Date input (DD.MM or DD.MM.YYYY) ─────────────────────────────────────────
   if (waitingForDateInput.has(ctx.chat.id)) {
@@ -985,9 +1039,11 @@ bot.on('callback_query:data', async (ctx) => {
   if (data === 'broadcast_select') {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
     session.isSelecting = true;
+    session.selectionMsgId = ctx.callbackQuery.message?.message_id;
+    const allChats = loadChats();
     await ctx.editMessageText(
-      `Виберіть чати для розсилки:\n<i>Вибрано: ${session.selectedChatIds.size}</i>`,
-      { parse_mode: 'HTML', reply_markup: buildSubsetKeyboard(session) },
+      `Виберіть чати для розсилки:\n<i>Вибрано: ${session.selectedChatIds.size} з ${allChats.length}</i>`,
+      { parse_mode: 'HTML', reply_markup: buildSubsetKeyboard(session, allChats) },
     );
     await ctx.answerCallbackQuery();
     return;
@@ -1001,15 +1057,28 @@ bot.on('callback_query:data', async (ctx) => {
     } else {
       session.selectedChatIds.add(targetId);
     }
-    await ctx.editMessageReplyMarkup({ reply_markup: buildSubsetKeyboard(session) });
+    const allChats = loadChats();
+    const query = session.searchQuery;
+    const visibleCount = query
+      ? allChats.filter((c) => c.title.toLowerCase().includes(query.toLowerCase())).length
+      : allChats.length;
+    const headerQuery = query ? `Пошук: "${query}" — ${visibleCount} чат(ів)` : `${allChats.length} чат(ів)`;
+    await ctx.editMessageText(
+      `Виберіть чати для розсилки:\n<i>${headerQuery} | Вибрано: ${session.selectedChatIds.size}</i>`,
+      { parse_mode: 'HTML', reply_markup: buildSubsetKeyboard(session, allChats) },
+    );
     await ctx.answerCallbackQuery();
     return;
   }
 
   if (data === 'subset_all') {
     if (!session) { await ctx.answerCallbackQuery(); return; }
-    loadChats().forEach((c) => session.selectedChatIds.add(c.id));
-    await ctx.editMessageReplyMarkup({ reply_markup: buildSubsetKeyboard(session) });
+    const allChats = loadChats();
+    allChats.forEach((c) => session.selectedChatIds.add(c.id));
+    await ctx.editMessageText(
+      `Виберіть чати для розсилки:\n<i>${allChats.length} чат(ів) | Вибрано: ${session.selectedChatIds.size}</i>`,
+      { parse_mode: 'HTML', reply_markup: buildSubsetKeyboard(session, allChats) },
+    );
     await ctx.answerCallbackQuery('Вибрано всі');
     return;
   }
@@ -1017,8 +1086,48 @@ bot.on('callback_query:data', async (ctx) => {
   if (data === 'subset_none') {
     if (!session) { await ctx.answerCallbackQuery(); return; }
     session.selectedChatIds.clear();
-    await ctx.editMessageReplyMarkup({ reply_markup: buildSubsetKeyboard(session) });
+    const allChats = loadChats();
+    await ctx.editMessageText(
+      `Виберіть чати для розсилки:\n<i>${allChats.length} чат(ів) | Вибрано: 0</i>`,
+      { parse_mode: 'HTML', reply_markup: buildSubsetKeyboard(session, allChats) },
+    );
     await ctx.answerCallbackQuery('Скинуто');
+    return;
+  }
+
+  // ── Subset search ─────────────────────────────────────────────────────────────
+  if (data === 'subset_search') {
+    if (!session) { await ctx.answerCallbackQuery(); return; }
+    session.selectionMsgId = ctx.callbackQuery.message?.message_id;
+    waitingForSubsetSearch.add(chatId);
+    await ctx.answerCallbackQuery();
+    await bot.api.sendMessage(chatId, '🔍 Введіть текст для пошуку:');
+    return;
+  }
+
+  if (data === 'subset_search_clear') {
+    if (!session) { await ctx.answerCallbackQuery(); return; }
+    delete session.searchQuery;
+    const allChats = loadChats();
+    await ctx.editMessageText(
+      `Виберіть чати для розсилки:\n<i>${allChats.length} чат(ів) | Вибрано: ${session.selectedChatIds.size}</i>`,
+      { parse_mode: 'HTML', reply_markup: buildSubsetKeyboard(session, allChats) },
+    );
+    await ctx.answerCallbackQuery('Пошук очищено');
+    return;
+  }
+
+  // ── Back to selection from confirmation ───────────────────────────────────────
+  if (data === 'broadcast_back_select') {
+    if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась.'); return; }
+    session.isSelecting = true;
+    session.selectionMsgId = ctx.callbackQuery.message?.message_id;
+    const allChats = loadChats();
+    await ctx.editMessageText(
+      `Виберіть чати для розсилки:\n<i>${allChats.length} чат(ів) | Вибрано: ${session.selectedChatIds.size}</i>`,
+      { parse_mode: 'HTML', reply_markup: buildSubsetKeyboard(session, allChats) },
+    );
+    await ctx.answerCallbackQuery();
     return;
   }
 
@@ -1032,17 +1141,34 @@ bot.on('callback_query:data', async (ctx) => {
       return;
     }
     session.isSelecting = false;
-    const count = session.selectedChatIds.size;
+    const allChats = loadChats();
+    const selected = allChats.filter((c) => session.selectedChatIds.has(c.id));
+    const preview = buildChatPreview(selected);
     await ctx.editMessageText(
-      `Надіслати в <b>${count}</b> вибраних чат(ів)?`,
-      { parse_mode: 'HTML', reply_markup: buildSubsetConfirmKeyboard(count) },
+      `📨 Розіслати в <b>${selected.length}</b> вибраних чат(ів):\n\n${preview}`,
+      { parse_mode: 'HTML', reply_markup: buildSubsetConfirmKeyboard() },
     );
     await ctx.answerCallbackQuery();
     return;
   }
 
-  // ── Immediate broadcast — all chats ──────────────────────────────────────────
+  // ── Immediate broadcast — all chats (show confirmation first) ────────────────
   if (data === 'broadcast_all') {
+    if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
+    const allChats = loadChats();
+    const preview = buildChatPreview(allChats);
+    await ctx.editMessageText(
+      `📨 Розіслати в усі <b>${allChats.length}</b> чат(ів):\n\n${preview}`,
+      { parse_mode: 'HTML', reply_markup: new InlineKeyboard()
+        .text(`✅ Підтвердити`, 'broadcast_all_confirm').row()
+        .text('❌ Скасувати', 'cancel_broadcast')
+      },
+    );
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (data === 'broadcast_all_confirm') {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
     broadcastSessions.delete(chatId);
     const allChats = loadChats();
