@@ -10,12 +10,24 @@ function ensureDataDir(): void {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-/** All records including removed ones. */
+/** All records including removed ones. Deduplicates by ID on read. */
 function loadAllChats(): ChatRecord[] {
   ensureDataDir();
   if (!fs.existsSync(DATA_FILE)) return [];
   try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8')) as ChatRecord[];
+    const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8')) as ChatRecord[];
+    const seen = new Set<number>();
+    const deduped = raw.filter((c) => {
+      if (seen.has(c.id)) return false;
+      seen.add(c.id);
+      return true;
+    });
+    // Clean up file if duplicates were found
+    if (deduped.length !== raw.length) {
+      console.log(`[Storage] Removed ${raw.length - deduped.length} duplicate chat(s) from chats.json`);
+      saveChats(deduped);
+    }
+    return deduped;
   } catch {
     return [];
   }
