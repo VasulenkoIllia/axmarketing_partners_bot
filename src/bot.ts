@@ -64,6 +64,37 @@ const waitingForSubsetSearch = new Set<number>();
 /** Pending scheduled broadcasts keyed by token. Multiple per admin are allowed. */
 const scheduledBroadcasts = new Map<string, ScheduledBroadcast>();
 
+/** Session expiry timers — auto-cancel broadcast session after 10 min of inactivity. */
+const sessionTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
+const SESSION_TTL_MS = 10 * 60 * 1000;
+
+function clearSession(chatId: number): void {
+  waitingForContent.delete(chatId);
+  waitingForTimeInput.delete(chatId);
+  waitingForDateInput.delete(chatId);
+  waitingForSubsetSearch.delete(chatId);
+  pendingScheduleDate.delete(chatId);
+  broadcastSessions.delete(chatId);
+  const t = sessionTimeouts.get(chatId);
+  if (t) { clearTimeout(t); sessionTimeouts.delete(chatId); }
+}
+
+function resetSessionTimer(chatId: number): void {
+  const existing = sessionTimeouts.get(chatId);
+  if (existing) clearTimeout(existing);
+  const handle = setTimeout(() => {
+    sessionTimeouts.delete(chatId);
+    const hasSession = waitingForContent.has(chatId) ||
+      waitingForTimeInput.has(chatId) ||
+      waitingForDateInput.has(chatId) ||
+      broadcastSessions.has(chatId);
+    if (!hasSession) return;
+    clearSession(chatId);
+    bot.api.sendMessage(chatId, '⏱ Сесія розсилки скасована через 10 хвилин неактивності.\nПочніть /broadcast заново.').catch(() => {});
+  }, SESSION_TTL_MS);
+  sessionTimeouts.set(chatId, handle);
+}
+
 /**
  * Tokens of cancelled scheduled broadcasts.
  * Used to stop already-started chained setTimeout chains safely.
@@ -557,10 +588,7 @@ bot.command('broadcast', async (ctx) => {
   }
 
   waitingForContent.add(ctx.chat.id);
-  waitingForTimeInput.delete(ctx.chat.id);
-  waitingForDateInput.delete(ctx.chat.id);
-  pendingScheduleDate.delete(ctx.chat.id);
-  broadcastSessions.delete(ctx.chat.id);
+  resetSessionTimer(ctx.chat.id);
 
   await ctx.reply(
     `📨 Надішліть повідомлення для розсилки в <b>${chats.length}</b> чат(ів).\n\n` +
@@ -579,12 +607,7 @@ bot.command('cancel', async (ctx) => {
   const hadContent = waitingForContent.has(chatId);
   const hadSession = broadcastSessions.has(chatId);
 
-  waitingForContent.delete(chatId);
-  waitingForTimeInput.delete(chatId);
-  waitingForDateInput.delete(chatId);
-  waitingForSubsetSearch.delete(chatId);
-  pendingScheduleDate.delete(chatId);
-  broadcastSessions.delete(chatId);
+  clearSession(chatId);
 
   if (hadContent || hadSession) {
     await ctx.reply('❌ Скасовано.');
@@ -762,9 +785,7 @@ bot.on('message', async (ctx) => {
       return;
     }
 
-    waitingForTimeInput.delete(ctx.chat.id);
-    pendingScheduleDate.delete(ctx.chat.id);
-    broadcastSessions.delete(ctx.chat.id);
+    clearSession(ctx.chat.id);
 
     const delayMs = fireAt.getTime() - Date.now();
     const fireLabel = formatScheduleLabel(fireAt);
@@ -865,6 +886,7 @@ bot.on('message', async (ctx) => {
     isSelecting: false,
   };
   broadcastSessions.set(ctx.chat.id, session);
+  resetSessionTimer(ctx.chat.id);
 
   await ctx.reply(
     `Надіслати це повідомлення?`,
@@ -1032,7 +1054,7 @@ bot.on('callback_query:data', async (ctx) => {
 
   // ── Cancel broadcast ──────────────────────────────────────────────────────────
   if (data === 'cancel_broadcast') {
-    broadcastSessions.delete(chatId);
+    clearSession(chatId);
     await ctx.editMessageText('❌ Розсилку скасовано.');
     await ctx.answerCallbackQuery();
     return;
@@ -1057,6 +1079,7 @@ bot.on('callback_query:data', async (ctx) => {
 
   if (data.startsWith('subset_toggle_')) {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась.'); return; }
+    resetSessionTimer(chatId);
     const targetId = Number(data.slice('subset_toggle_'.length));
     if (session.selectedChatIds.has(targetId)) {
       session.selectedChatIds.delete(targetId);
@@ -1177,7 +1200,7 @@ bot.on('callback_query:data', async (ctx) => {
 
   if (data === 'broadcast_all_confirm') {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
-    broadcastSessions.delete(chatId);
+    clearSession(chatId);
     const allChats = loadChats();
     session.selectedChatIds = new Set(allChats.map((c) => c.id));
     await ctx.editMessageText(`⏳ Надсилаю в ${allChats.length} чат(ів)...`);
@@ -1190,10 +1213,10 @@ bot.on('callback_query:data', async (ctx) => {
   if (data === 'broadcast_selected') {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
     const count = session.selectedChatIds.size;
-    broadcastSessions.delete(chatId);
+    clearSession(chatId);
     await ctx.editMessageText(`⏳ Надсилаю в ${count} вибраних чат(ів)...`);
     await ctx.answerCallbackQuery('Починаю розсилку...');
-    await executeBroadcast(chatId, msgId, session); // selectedChatIds stays as-is
+    await executeBroadcast(chatId, msgId, session);
     return;
   }
 
@@ -1248,7 +1271,7 @@ bot.on('callback_query:data', async (ctx) => {
     const fireAt = new Date(Date.now() + delayMs);
 
     const capturedSession = { ...session, selectedChatIds: new Set(session.selectedChatIds) };
-    broadcastSessions.delete(chatId);
+    clearSession(chatId);
 
     const fireLabel = formatScheduleLabel(fireAt);
     const schedToken = token();
