@@ -27,17 +27,21 @@ async function sendLong(
     await bot.api.sendMessage(chatId, text, opts);
     return;
   }
-  const blocks = text.split('\n\n');
-  let chunk = '';
   const { reply_markup, ...optsWithoutMarkup } = opts as Record<string, unknown>;
-  for (const block of blocks) {
-    if (chunk.length + block.length + 2 > MAX) {
-      await bot.api.sendMessage(chatId, chunk.trim(), optsWithoutMarkup as typeof opts);
-      chunk = '';
+  // Split by line — handles cases where a single paragraph exceeds MAX
+  const lines = text.split('\n');
+  let chunk = '';
+  for (const line of lines) {
+    if (chunk.length + line.length + 1 > MAX) {
+      if (chunk.trim()) {
+        await bot.api.sendMessage(chatId, chunk.trim(), optsWithoutMarkup as typeof opts);
+      }
+      chunk = line;
+    } else {
+      chunk += (chunk ? '\n' : '') + line;
     }
-    chunk += (chunk ? '\n\n' : '') + block;
   }
-  // Only the last chunk gets the reply_markup
+  // Only the last chunk gets the reply_markup (keyboard)
   if (chunk.trim()) await bot.api.sendMessage(chatId, chunk.trim(), opts);
 }
 
