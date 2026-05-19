@@ -147,6 +147,8 @@ async function notifyAdmins(text: string, opts: Parameters<typeof bot.api.sendMe
 // ─── /removechat pagination ───────────────────────────────────────────────────
 
 const REMOVE_PAGE_SIZE = 8;
+const SUBSET_PAGE_SIZE = 8;
+const RESTORE_PAGE_SIZE = 8;
 
 function buildRemoveKeyboard(
   chats: ChatRecord[],
@@ -183,6 +185,42 @@ function buildRemoveKeyboard(
   return { text, keyboard: kb };
 }
 
+function buildRestoreKeyboard(
+  removed: ChatRecord[],
+  page: number,
+): { text: string; keyboard: InlineKeyboard } {
+  const totalPages = Math.max(1, Math.ceil(removed.length / RESTORE_PAGE_SIZE));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const start = safePage * RESTORE_PAGE_SIZE;
+  const pageChats = removed.slice(start, start + RESTORE_PAGE_SIZE);
+
+  const kb = new InlineKeyboard();
+  pageChats.forEach((chat) => {
+    const label = chat.title.length > 24 ? chat.title.slice(0, 23) + '…' : chat.title;
+    kb.text(`🔄 ${label}`, `rs_p${safePage}_${chat.id}`).row();
+  });
+
+  if (totalPages > 1) {
+    if (safePage > 0) kb.text('◀️', `rspage_${safePage - 1}`);
+    kb.text(`${safePage + 1}/${totalPages}`, 'noop');
+    if (safePage < totalPages - 1) kb.text('▶️', `rspage_${safePage + 1}`);
+    kb.row();
+  }
+
+  const from = start + 1;
+  const to = Math.min(start + RESTORE_PAGE_SIZE, removed.length);
+  const lines = pageChats.map((chat, i) => {
+    const when = chat.removedAt ? timeAgo(chat.removedAt) : '—';
+    return `${start + i + 1}. <b>${chat.title}</b> <i>(видалено ${when})</i>`;
+  });
+  const paginationNote = totalPages > 1 ? `\n<i>${from}–${to} з ${removed.length}</i>` : '';
+  const text =
+    `<b>Видалені чати (${removed.length}):</b>\n\n${lines.join('\n')}${paginationNote}\n\n` +
+    `Натисніть кнопку щоб повернути чат до списку розсилки.`;
+
+  return { text, keyboard: kb };
+}
+
 /** Shown after content is sent — before audience is chosen. */
 function buildConfirmKeyboard(count: number): InlineKeyboard {
   return new InlineKeyboard()
@@ -214,6 +252,11 @@ function buildSubsetKeyboard(session: BroadcastSession, allChats?: ChatRecord[])
   const query = session.searchQuery?.toLowerCase().trim();
   const visible = query ? chats.filter((c) => c.title.toLowerCase().includes(query)) : chats;
 
+  const totalPages = Math.max(1, Math.ceil(visible.length / SUBSET_PAGE_SIZE));
+  const safePage = Math.max(0, Math.min(session.subsetPage ?? 0, totalPages - 1));
+  const start = safePage * SUBSET_PAGE_SIZE;
+  const pageChats = visible.slice(start, start + SUBSET_PAGE_SIZE);
+
   const kb = new InlineKeyboard();
 
   // Search row
@@ -226,10 +269,16 @@ function buildSubsetKeyboard(session: BroadcastSession, allChats?: ChatRecord[])
   if (visible.length === 0) {
     kb.text('— нічого не знайдено —', 'noop').row();
   } else {
-    for (const chat of visible) {
+    for (const chat of pageChats) {
       const icon = session.selectedChatIds.has(chat.id) ? '☑️' : '☐';
       const label = chat.title.length > 26 ? chat.title.slice(0, 25) + '…' : chat.title;
       kb.text(`${icon} ${label}`, `subset_toggle_${chat.id}`).row();
+    }
+    if (totalPages > 1) {
+      if (safePage > 0) kb.text('◀️', `subset_page_${safePage - 1}`);
+      kb.text(`${safePage + 1}/${totalPages}`, 'noop');
+      if (safePage < totalPages - 1) kb.text('▶️', `subset_page_${safePage + 1}`);
+      kb.row();
     }
   }
 
@@ -666,20 +715,8 @@ bot.command('removedchats', async (ctx) => {
     return;
   }
 
-  const kb = new InlineKeyboard();
-  const lines: string[] = [];
-
-  removed.forEach((chat, i) => {
-    const when = chat.removedAt ? timeAgo(chat.removedAt) : '—';
-    lines.push(`${i + 1}. <b>${chat.title}</b> <i>(видалено ${when})</i>`);
-    kb.text(`🔄 ${chat.title.length > 24 ? chat.title.slice(0, 23) + '…' : chat.title}`, `restore_${chat.id}`).row();
-  });
-
-  await ctx.reply(
-    `<b>Видалені чати (${removed.length}):</b>\n\n${lines.join('\n')}\n\n` +
-    `Натисніть кнопку щоб повернути чат до списку розсилки.`,
-    { parse_mode: 'HTML', reply_markup: kb },
-  );
+  const { text, keyboard } = buildRestoreKeyboard(removed, 0);
+  await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard });
 });
 
 // ─── Broadcast content capture ────────────────────────────────────────────────
@@ -695,6 +732,7 @@ bot.on('message', async (ctx) => {
     if (!session || !session.selectionMsgId) return;
     const query = ('text' in ctx.message ? ctx.message.text?.trim() : '') ?? '';
     session.searchQuery = query || undefined;
+    session.subsetPage = 0;
     // Clean up: delete user's search input + our prompt message
     await bot.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
     if (session.searchPromptMsgId) {
@@ -968,32 +1006,32 @@ bot.on('callback_query:data', async (ctx) => {
     return;
   }
 
-  // ── Restore removed chat ─────────────────────────────────────────────────────
-  if (data.startsWith('restore_')) {
-    const targetId = Number(data.slice('restore_'.length));
+  // ── Restore removed chat (paginated) ─────────────────────────────────────────
+  if (data.startsWith('rspage_')) {
+    const page = parseInt(data.slice('rspage_'.length), 10);
+    const removed = loadRemovedChats();
+    const { text, keyboard } = buildRestoreKeyboard(removed, page);
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (data.startsWith('rs_p')) {
+    const body = data.slice('rs_p'.length);
+    const sep = body.indexOf('_');
+    const page = parseInt(body.slice(0, sep), 10);
+    const targetId = Number(body.slice(sep + 1));
     const ok = restoreChat(targetId);
     if (!ok) {
       await ctx.answerCallbackQuery('Чат не знайдено або вже активний.');
       return;
     }
-
-    // Refresh the list in-place
     const remaining = loadRemovedChats();
     if (remaining.length === 0) {
       await ctx.editMessageText('✅ Чат повернено до розсилки. Видалених чатів більше немає.');
     } else {
-      const kb = new InlineKeyboard();
-      const lines: string[] = [];
-      remaining.forEach((chat, i) => {
-        const when = chat.removedAt ? timeAgo(chat.removedAt) : '—';
-        lines.push(`${i + 1}. <b>${chat.title}</b> <i>(видалено ${when})</i>`);
-        kb.text(`🔄 ${chat.title.length > 24 ? chat.title.slice(0, 23) + '…' : chat.title}`, `restore_${chat.id}`).row();
-      });
-      await ctx.editMessageText(
-        `<b>Видалені чати (${remaining.length}):</b>\n\n${lines.join('\n')}\n\n` +
-        `Натисніть кнопку щоб повернути чат до списку розсилки.`,
-        { parse_mode: 'HTML', reply_markup: kb },
-      );
+      const { text, keyboard } = buildRestoreKeyboard(remaining, page);
+      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
     }
     await ctx.answerCallbackQuery('✅ Повернено до розсилки');
     return;
@@ -1071,10 +1109,28 @@ bot.on('callback_query:data', async (ctx) => {
   if (data === 'broadcast_select') {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
     session.isSelecting = true;
+    session.subsetPage = 0;
     session.selectionMsgId = ctx.callbackQuery.message?.message_id;
     const allChats = loadChats();
     await ctx.editMessageText(
       `Виберіть чати для розсилки:\n<i>Вибрано: ${session.selectedChatIds.size} з ${allChats.length}</i>`,
+      { parse_mode: 'HTML', reply_markup: buildSubsetKeyboard(session, allChats) },
+    );
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (data.startsWith('subset_page_')) {
+    if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась.'); return; }
+    session.subsetPage = parseInt(data.slice('subset_page_'.length), 10);
+    const allChats = loadChats();
+    const query = session.searchQuery;
+    const visibleCount = query
+      ? allChats.filter((c) => c.title.toLowerCase().includes(query.toLowerCase())).length
+      : allChats.length;
+    const headerQuery = query ? `Пошук: "${escapeHtml(query)}" — ${visibleCount} чат(ів)` : `${allChats.length} чат(ів)`;
+    await ctx.editMessageText(
+      `Виберіть чати для розсилки:\n<i>${headerQuery} | Вибрано: ${session.selectedChatIds.size}</i>`,
       { parse_mode: 'HTML', reply_markup: buildSubsetKeyboard(session, allChats) },
     );
     await ctx.answerCallbackQuery();
@@ -1142,6 +1198,7 @@ bot.on('callback_query:data', async (ctx) => {
   if (data === 'subset_search_clear') {
     if (!session) { await ctx.answerCallbackQuery(); return; }
     delete session.searchQuery;
+    session.subsetPage = 0;
     const allChats = loadChats();
     await ctx.editMessageText(
       `Виберіть чати для розсилки:\n<i>${allChats.length} чат(ів) | Вибрано: ${session.selectedChatIds.size}</i>`,
@@ -1155,6 +1212,7 @@ bot.on('callback_query:data', async (ctx) => {
   if (data === 'broadcast_back_select') {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась.'); return; }
     session.isSelecting = true;
+    session.subsetPage = 0;
     session.selectionMsgId = ctx.callbackQuery.message?.message_id;
     const allChats = loadChats();
     await ctx.editMessageText(

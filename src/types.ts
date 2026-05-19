@@ -33,6 +33,7 @@ export interface BroadcastSession {
   selectedChatIds: Set<number>; // managed during subset selection
   isSelecting: boolean;
   searchQuery?: string;       // active filter in subset keyboard
+  subsetPage?: number;        // current page in subset keyboard (default 0)
   selectionMsgId?: number;    // message ID of the selection keyboard (for search + back button)
   searchPromptMsgId?: number; // message ID of the "Введіть текст для пошуку:" prompt
 }
