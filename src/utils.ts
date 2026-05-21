@@ -2,6 +2,7 @@ import crypto from 'crypto';
 
 export function timeAgo(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
+  if (isNaN(diff)) return '—';
   const min = Math.floor(diff / 60_000);
   const hrs = Math.floor(diff / 3_600_000);
   const days = Math.floor(diff / 86_400_000);

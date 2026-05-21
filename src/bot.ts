@@ -72,6 +72,19 @@ const scheduledBroadcasts = new Map<string, ScheduledBroadcast>();
 const sessionTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
 const SESSION_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * Buffer for media group albums: Telegram delivers each photo/video as a
+ * separate message. We wait MEDIA_GROUP_FLUSH_MS after the last frame before
+ * treating the whole group as a single broadcast item.
+ */
+const mediaGroupBuffer = new Map<string, {
+  chatId: number;
+  sourceChatId: number;
+  messageIds: number[];
+  timer: ReturnType<typeof setTimeout>;
+}>();
+const MEDIA_GROUP_FLUSH_MS = 400;
+
 function clearSession(chatId: number): void {
   waitingForContent.delete(chatId);
   waitingForTimeInput.delete(chatId);
@@ -81,6 +94,13 @@ function clearSession(chatId: number): void {
   broadcastSessions.delete(chatId);
   const t = sessionTimeouts.get(chatId);
   if (t) { clearTimeout(t); sessionTimeouts.delete(chatId); }
+  // Cancel any pending media-group album collection for this admin
+  for (const [groupId, entry] of mediaGroupBuffer.entries()) {
+    if (entry.chatId === chatId) {
+      clearTimeout(entry.timer);
+      mediaGroupBuffer.delete(groupId);
+    }
+  }
 }
 
 function resetSessionTimer(chatId: number): void {
@@ -211,7 +231,7 @@ function buildRestoreKeyboard(
   const to = Math.min(start + RESTORE_PAGE_SIZE, removed.length);
   const lines = pageChats.map((chat, i) => {
     const when = chat.removedAt ? timeAgo(chat.removedAt) : '—';
-    return `${start + i + 1}. <b>${chat.title}</b> <i>(видалено ${when})</i>`;
+    return `${start + i + 1}. <b>${escapeHtml(chat.title)}</b> <i>(видалено ${when})</i>`;
   });
   const paginationNote = totalPages > 1 ? `\n<i>${from}–${to} з ${removed.length}</i>` : '';
   const text =
@@ -296,7 +316,7 @@ function buildSubsetKeyboard(session: BroadcastSession, allChats?: ChatRecord[])
 /** Returns a preview list of chat names for confirmation screens. */
 function buildChatPreview(chats: ChatRecord[]): string {
   const MAX = 5;
-  const lines = chats.slice(0, MAX).map((c) => `• ${c.title}`);
+  const lines = chats.slice(0, MAX).map((c) => `• ${escapeHtml(c.title)}`);
   if (chats.length > MAX) lines.push(`<i>...ще ${chats.length - MAX}</i>`);
   return lines.join('\n');
 }
@@ -309,7 +329,7 @@ function buildReport(
 
   if (results.failed > 0) {
     text += `\n❌ Помилок: ${results.failed}\n\n<b>Деталі:</b>\n`;
-    text += results.errors.map((e) => `• ${e.chat.title}: ${e.error}`).join('\n');
+    text += results.errors.map((e) => `• ${escapeHtml(e.chat.title)}: ${escapeHtml(e.error)}`).join('\n');
   }
 
   if (results.deadChatIds.length === 0) return { text, keyboard: undefined };
@@ -328,6 +348,35 @@ function buildReport(
   return { text, keyboard: kb };
 }
 
+/**
+ * Creates a broadcast session and sends the confirm keyboard to the admin.
+ * Used for both single messages and media-group albums.
+ */
+function createBroadcastSession(
+  adminChatId: number,
+  sourceChatId: number,
+  messageId: number,
+  messageIds: number[] | undefined,
+  chats: ChatRecord[],
+): void {
+  const session: BroadcastSession = {
+    pending: { sourceChatId, messageId, messageIds },
+    selectedChatIds: new Set(chats.map((c) => c.id)),
+    isSelecting: false,
+  };
+  broadcastSessions.set(adminChatId, session);
+  resetSessionTimer(adminChatId);
+
+  const isAlbum = messageIds && messageIds.length > 1;
+  const text = isAlbum
+    ? `Надіслати цей альбом (${messageIds.length} медіа)?`
+    : `Надіслати це повідомлення?`;
+
+  bot.api
+    .sendMessage(adminChatId, text, { reply_markup: buildConfirmKeyboard(chats.length) })
+    .catch((err) => console.error('[createBroadcastSession]', err));
+}
+
 async function executeBroadcast(
   adminChatId: number,
   processingMsgId: number | undefined,
@@ -343,6 +392,7 @@ async function executeBroadcast(
     targets,
     session.pending.sourceChatId,
     session.pending.messageId,
+    session.pending.messageIds,
   );
 
   // Feature 4: delete the "⏳ Sending..." service message
@@ -369,13 +419,13 @@ bot.on('my_chat_member', async (ctx) => {
   if (newStatus === 'member' || newStatus === 'administrator') {
     addChat({ id: chat.id, title: chatTitle, addedAt: new Date().toISOString() });
     await notifyAdmins(
-      `✅ Доданий до: <b>${chatTitle}</b>\nID: <code>${chat.id}</code>`,
+      `✅ Доданий до: <b>${escapeHtml(chatTitle)}</b>\nID: <code>${chat.id}</code>`,
       { parse_mode: 'HTML' },
     );
   } else if (newStatus === 'left' || newStatus === 'kicked') {
     const removed = removeChat(chat.id);
     if (removed) {
-      await notifyAdmins(`❌ Видалений з: <b>${chatTitle}</b>`, { parse_mode: 'HTML' });
+      await notifyAdmins(`❌ Видалений з: <b>${escapeHtml(chatTitle)}</b>`, { parse_mode: 'HTML' });
     }
   }
 });
@@ -453,7 +503,7 @@ bot.command('list', async (ctx) => {
   // Feature 3: show lastBroadcast relative time
   const lines = chats.map((c, i) => {
     const last = c.lastBroadcast ? timeAgo(c.lastBroadcast) : 'ніколи';
-    return `${i + 1}. <b>${c.title}</b>\n   ID: <code>${c.id}</code>  |  Розсилка: ${last}`;
+    return `${i + 1}. <b>${escapeHtml(c.title)}</b>\n   ID: <code>${c.id}</code>  |  Розсилка: ${last}`;
   });
   await sendLong(
     ctx.chat.id,
@@ -484,15 +534,15 @@ bot.command('checkchats', async (ctx) => {
     try {
       const member = await bot.api.getChatMember(chat.id, botId);
       if (member.status === 'administrator' || member.status === 'creator') {
-        ok.push(`✅ ${chat.title}`);
+        ok.push(`✅ ${escapeHtml(chat.title)}`);
       } else if (member.status === 'member') {
-        warn.push(`⚠️ ${chat.title} <i>(учасник, не адмін)</i>`);
+        warn.push(`⚠️ ${escapeHtml(chat.title)} <i>(учасник, не адмін)</i>`);
       } else {
-        dead.push(`❌ ${chat.title}`);
+        dead.push(`❌ ${escapeHtml(chat.title)}`);
         deadIds.push(chat.id);
       }
     } catch {
-      dead.push(`❌ ${chat.title}`);
+      dead.push(`❌ ${escapeHtml(chat.title)}`);
       deadIds.push(chat.id);
     }
     // Small delay to avoid hitting getChatMember rate limits
@@ -549,7 +599,7 @@ async function addChatById(adminChatId: number, targetChatId: number): Promise<v
   if (existing) {
     await bot.api.sendMessage(
       adminChatId,
-      `ℹ️ Чат <b>${existing.title}</b> вже є в списку.`,
+      `ℹ️ Чат <b>${escapeHtml(existing.title)}</b> вже є в списку.`,
       { parse_mode: 'HTML' },
     );
     return;
@@ -574,7 +624,7 @@ async function addChatById(adminChatId: number, targetChatId: number): Promise<v
     addChat({ id: targetChatId, title, addedAt: new Date().toISOString() });
     await bot.api.sendMessage(
       adminChatId,
-      `✅ Чат <b>${title}</b> додано до списку розсилки.`,
+      `✅ Чат <b>${escapeHtml(title)}</b> додано до списку розсилки.`,
       { parse_mode: 'HTML' },
     );
   } catch {
@@ -683,7 +733,8 @@ bot.command('cancel', async (ctx) => {
 bot.command('scheduled', async (ctx) => {
   if (!isAdmin(ctx.chat.id)) return;
 
-  const entries = [...scheduledBroadcasts.entries()];
+  const entries = [...scheduledBroadcasts.entries()]
+    .filter(([, s]) => s.adminChatId === ctx.chat.id);
 
   if (entries.length === 0) {
     await ctx.reply('Немає запланованих розсилок.');
@@ -901,7 +952,7 @@ bot.on('message', async (ctx) => {
 
       const alreadyAdded = loadChats().some((c) => c.id === sourceId);
       if (alreadyAdded) {
-        await ctx.reply(`ℹ️ Чат <b>${sourceTitle}</b> вже є в списку розсилки.`, {
+        await ctx.reply(`ℹ️ Чат <b>${escapeHtml(sourceTitle ?? String(sourceId))}</b> вже є в списку розсилки.`, {
           parse_mode: 'HTML',
         });
         return;
@@ -912,27 +963,57 @@ bot.on('message', async (ctx) => {
         .text('❌ Ні', 'cancel_add');
 
       await ctx.reply(
-        `Додати <b>${sourceTitle}</b> до списку розсилки?`,
+        `Додати <b>${escapeHtml(sourceTitle ?? String(sourceId))}</b> до списку розсилки?`,
         { parse_mode: 'HTML', reply_markup: keyboard },
       );
     }
     return;
   }
 
+  // ── Media group (album): collect all frames before confirming ─────────────────
+  const adminChatId = ctx.chat.id;
+  const mediaGroupId = ctx.message.media_group_id;
+
+  if (mediaGroupId) {
+    const existing = mediaGroupBuffer.get(mediaGroupId);
+    if (existing) {
+      // Another frame of the same album — add ID and reset flush timer
+      existing.messageIds.push(ctx.message.message_id);
+      clearTimeout(existing.timer);
+      existing.timer = setTimeout(() => {
+        mediaGroupBuffer.delete(mediaGroupId);
+        waitingForContent.delete(adminChatId);
+        createBroadcastSession(
+          adminChatId,
+          existing.sourceChatId,
+          existing.messageIds[0],
+          existing.messageIds,
+          loadChats(),
+        );
+      }, MEDIA_GROUP_FLUSH_MS);
+    } else {
+      // First frame — open buffer, keep waitingForContent alive for next frames
+      const sourceChatId = ctx.message.chat.id;
+      const ids = [ctx.message.message_id];
+      const timer = setTimeout(() => {
+        mediaGroupBuffer.delete(mediaGroupId);
+        waitingForContent.delete(adminChatId);
+        createBroadcastSession(adminChatId, sourceChatId, ids[0], ids, loadChats());
+      }, MEDIA_GROUP_FLUSH_MS);
+      mediaGroupBuffer.set(mediaGroupId, { chatId: adminChatId, sourceChatId, messageIds: ids, timer });
+      // Do NOT delete from waitingForContent — stay ready for remaining frames
+    }
+    return;
+  }
+
+  // ── Single message ────────────────────────────────────────────────────────────
   waitingForContent.delete(ctx.chat.id);
-  const chats = loadChats();
-
-  const session: BroadcastSession = {
-    pending: { sourceChatId: ctx.message.chat.id, messageId: ctx.message.message_id },
-    selectedChatIds: new Set(chats.map((c) => c.id)),
-    isSelecting: false,
-  };
-  broadcastSessions.set(ctx.chat.id, session);
-  resetSessionTimer(ctx.chat.id);
-
-  await ctx.reply(
-    `Надіслати це повідомлення?`,
-    { reply_markup: buildConfirmKeyboard(chats.length) },
+  createBroadcastSession(
+    ctx.chat.id,
+    ctx.message.chat.id,
+    ctx.message.message_id,
+    undefined,
+    loadChats(),
   );
 });
 
@@ -1070,12 +1151,13 @@ bot.on('callback_query:data', async (ctx) => {
       scheduledBroadcasts.delete(schedToken);
       removeScheduledEntry(schedToken);
       await bot.api
-        .editMessageText(chatId, sched.statusMessageId, `❌ Розсилку ${sched.label} скасовано.`)
+        .editMessageText(sched.adminChatId, sched.statusMessageId, `❌ Розсилку ${sched.label} скасовано.`)
         .catch(() => {});
     }
 
-    // Refresh the /scheduled list in-place
-    const remaining = [...scheduledBroadcasts.entries()];
+    // Refresh the /scheduled list in-place — only this admin's entries
+    const remaining = [...scheduledBroadcasts.entries()]
+      .filter(([, s]) => s.adminChatId === chatId);
     if (remaining.length === 0) {
       await ctx.editMessageText('✅ Скасовано. Немає більше запланованих розсилок.');
     } else {
@@ -1122,7 +1204,9 @@ bot.on('callback_query:data', async (ctx) => {
 
   if (data.startsWith('subset_page_')) {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась.'); return; }
-    session.subsetPage = parseInt(data.slice('subset_page_'.length), 10);
+    const parsedPage = parseInt(data.slice('subset_page_'.length), 10);
+    if (isNaN(parsedPage)) { await ctx.answerCallbackQuery(); return; }
+    session.subsetPage = parsedPage;
     const allChats = loadChats();
     const query = session.searchQuery;
     const visibleCount = query
@@ -1288,7 +1372,7 @@ bot.on('callback_query:data', async (ctx) => {
     const dayPicker = new InlineKeyboard()
       .text('Сьогодні', 'sched_day_today').text('Завтра', 'sched_day_tomorrow').row()
       .text('📅 Інша дата', 'sched_day_pick').row()
-      .text('❌ Скасувати', 'cancel');
+      .text('❌ Скасувати', 'cancel_broadcast');
     await ctx.editMessageText(
       '📅 Оберіть день для розсилки:',
       { reply_markup: dayPicker },
@@ -1329,6 +1413,7 @@ bot.on('callback_query:data', async (ctx) => {
     if (!session) { await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.'); return; }
 
     const minutes = parseInt(data.slice('sched_'.length), 10);
+    if (isNaN(minutes) || minutes <= 0) { await ctx.answerCallbackQuery(); return; }
     const delayMs = minutes * 60_000;
     const fireAt = new Date(Date.now() + delayMs);
 

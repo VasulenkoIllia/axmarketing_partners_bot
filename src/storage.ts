@@ -15,9 +15,13 @@ function loadAllChats(): ChatRecord[] {
   ensureDataDir();
   if (!fs.existsSync(DATA_FILE)) return [];
   try {
-    const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8')) as ChatRecord[];
+    const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
+    if (!Array.isArray(raw)) {
+      console.error('[Storage] chats.json is not an array — treating as empty');
+      return [];
+    }
     const seen = new Set<number>();
-    const deduped = raw.filter((c) => {
+    const deduped = (raw as ChatRecord[]).filter((c) => {
       if (seen.has(c.id)) return false;
       seen.add(c.id);
       return true;
@@ -28,7 +32,8 @@ function loadAllChats(): ChatRecord[] {
       saveChats(deduped);
     }
     return deduped;
-  } catch {
+  } catch (err) {
+    console.error('[Storage] Failed to read chats.json:', err);
     return [];
   }
 }
@@ -111,12 +116,14 @@ export function migrateChat(oldChatId: number, newChatId: number): void {
   const chat = chats.find((c) => c.id === oldChatId);
   if (!chat) return;
   chat.id = newChatId;
-  // Remove any duplicate for the new ID
-  const deduped = chats.filter((c) => c.id !== oldChatId || c === chat);
-  const withoutDup = deduped.filter(
-    (c, i, arr) => c.id !== newChatId || arr.indexOf(c) === i,
-  );
-  saveChats(withoutDup);
+  // Deduplicate by ID value (not by object reference) — keep first occurrence
+  const seen = new Set<number>();
+  const deduped = chats.filter((c) => {
+    if (seen.has(c.id)) return false;
+    seen.add(c.id);
+    return true;
+  });
+  saveChats(deduped);
 }
 
 export function updateLastBroadcast(chatId: number): void {
@@ -149,8 +156,14 @@ export function updateLastBroadcastBatch(chatIds: number[]): void {
 export function loadScheduled(): PersistedSchedule[] {
   if (!fs.existsSync(SCHEDULED_FILE)) return [];
   try {
-    return JSON.parse(fs.readFileSync(SCHEDULED_FILE, 'utf-8')) as PersistedSchedule[];
-  } catch {
+    const raw = JSON.parse(fs.readFileSync(SCHEDULED_FILE, 'utf-8'));
+    if (!Array.isArray(raw)) {
+      console.error('[Storage] scheduled.json is not an array — treating as empty');
+      return [];
+    }
+    return raw as PersistedSchedule[];
+  } catch (err) {
+    console.error('[Storage] Failed to read scheduled.json:', err);
     return [];
   }
 }

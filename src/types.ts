@@ -8,7 +8,8 @@ export interface ChatRecord {
 
 export interface PendingBroadcast {
   sourceChatId: number;
-  messageId: number;
+  messageId: number;        // first (or only) message ID — always set
+  messageIds?: number[];    // all IDs when sending a media group album (2–10 items)
 }
 
 export interface BroadcastResult {

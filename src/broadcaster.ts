@@ -20,7 +20,7 @@ function isDeadChatError(message: string): boolean {
 }
 
 /**
- * Attempts copyMessage with automatic handling of:
+ * Attempts copyMessage / copyMessages with automatic handling of:
  * - 429 Too Many Requests: waits retry_after then retries once
  * - Group→supergroup migration: updates storage, retries with new ID
  *
@@ -31,9 +31,20 @@ async function tryCopyMessage(
   chat: ChatRecord,
   sourceChatId: number,
   messageId: number,
+  messageIds?: number[],
 ): Promise<number> {
+  const isAlbum = messageIds && messageIds.length > 1;
+
+  const doCopy = async (targetId: number) => {
+    if (isAlbum) {
+      await bot.api.copyMessages(targetId, sourceChatId, messageIds);
+    } else {
+      await bot.api.copyMessage(targetId, sourceChatId, messageId);
+    }
+  };
+
   try {
-    await bot.api.copyMessage(chat.id, sourceChatId, messageId);
+    await doCopy(chat.id);
     return chat.id;
   } catch (err: unknown) {
     if (!(err instanceof GrammyError)) throw err;
@@ -42,7 +53,7 @@ async function tryCopyMessage(
     if (err.error_code === 429) {
       const retryAfter = ((err.parameters as { retry_after?: number })?.retry_after ?? 5) * 1000;
       await sleep(retryAfter);
-      await bot.api.copyMessage(chat.id, sourceChatId, messageId);
+      await doCopy(chat.id);
       return chat.id;
     }
 
@@ -50,7 +61,7 @@ async function tryCopyMessage(
     const newChatId = (err.parameters as { migrate_to_chat_id?: number })?.migrate_to_chat_id;
     if (newChatId) {
       migrateChat(chat.id, newChatId); // update storage: old ID → new ID
-      await bot.api.copyMessage(newChatId, sourceChatId, messageId);
+      await doCopy(newChatId);
       return newChatId;
     }
 
@@ -59,21 +70,23 @@ async function tryCopyMessage(
 }
 
 /**
- * Sends a copy of a message to each chat with rate-limiting.
- * @param chats Already-filtered list of target chats.
+ * Sends a copy of a message (or album) to each chat with rate-limiting.
+ * @param chats      Already-filtered list of target chats.
+ * @param messageIds When set and length > 1, sends as a media group album.
  */
 export async function broadcast(
   bot: Bot,
   chats: ChatRecord[],
   sourceChatId: number,
   messageId: number,
+  messageIds?: number[],
 ): Promise<BroadcastResult> {
   const result: BroadcastResult = { success: 0, failed: 0, errors: [], deadChatIds: [] };
   const succeededIds: number[] = [];
 
   for (const chat of chats) {
     try {
-      const usedChatId = await tryCopyMessage(bot, chat, sourceChatId, messageId);
+      const usedChatId = await tryCopyMessage(bot, chat, sourceChatId, messageId, messageIds);
       succeededIds.push(usedChatId);
       result.success++;
     } catch (err: unknown) {
