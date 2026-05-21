@@ -383,6 +383,8 @@ async function executeBroadcast(
   session: BroadcastSession,
 ): Promise<void> {
   const allChats = loadChats();
+  // size === 0 means "all chats" — used when restoring scheduled broadcasts
+  // where selectedChatIds: null is stored as an empty Set (see restoreScheduledBroadcasts)
   const targets = session.selectedChatIds.size > 0
     ? allChats.filter((c) => session.selectedChatIds.has(c.id))
     : allChats;
@@ -710,7 +712,15 @@ bot.command('cancel', async (ctx) => {
   const hadContent = waitingForContent.has(chatId);
   const hadSession = broadcastSessions.has(chatId);
 
+  // Save searchPromptMsgId before clearSession destroys the session object
+  const searchPromptMsgId = broadcastSessions.get(chatId)?.searchPromptMsgId;
+
   clearSession(chatId);
+
+  // Delete the lingering "🔍 Введіть текст для пошуку:" prompt if search was active
+  if (searchPromptMsgId) {
+    await bot.api.deleteMessage(chatId, searchPromptMsgId).catch(() => {});
+  }
 
   if (hadContent || hadSession) {
     await ctx.reply('❌ Скасовано.');
@@ -1084,6 +1094,12 @@ bot.on('callback_query:data', async (ctx) => {
     await ctx.editMessageReplyMarkup({ reply_markup: undefined });
     await ctx.answerCallbackQuery();
     await addChatById(chatId, targetId);
+    return;
+  }
+
+  // ── Legacy restore_ callbacks (pre-pagination format) ────────────────────────
+  if (data.startsWith('restore_')) {
+    await ctx.answerCallbackQuery('Список оновився. Відкрийте /removedchats заново.');
     return;
   }
 
